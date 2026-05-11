@@ -1781,6 +1781,18 @@ export class LcmContextEngine implements ContextEngine {
     return this.config.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   }
 
+  /**
+   * v4.2 §B — read-only window into the resolved config so tools that
+   * need a config-bound value (e.g. `lcm_describe` validating paths
+   * under `largeFilesDir`) can ask without mutating engine state.
+   */
+  get configView(): Pick<LcmConfig, "largeFilesDir" | "stubLargeToolPayloads"> {
+    return {
+      largeFilesDir: this.config.largeFilesDir,
+      stubLargeToolPayloads: this.config.stubLargeToolPayloads,
+    };
+  }
+
   private conversationStore: ConversationStore;
   private summaryStore: SummaryStore;
   private compactionTelemetryStore: CompactionTelemetryStore;
@@ -6955,6 +6967,10 @@ export class LcmContextEngine implements ContextEngine {
         promptAwareEviction: this.config.promptAwareEviction,
         prompt: params.prompt,
         orphanStrippingOrdinal: stableOrphanStrippingOrdinal,
+        // v4.2 §B — gated by config.stubLargeToolPayloads (default false).
+        // Off-by-default so v4.1 behavior is preserved until the migration
+        // tool has populated `messages.large_content` for the running DB.
+        stubLargeToolPayloads: this.config.stubLargeToolPayloads,
       });
       if (cacheAwareState === "hot") {
         this.setStableOrphanStrippingOrdinal(
@@ -6990,8 +7006,14 @@ export class LcmContextEngine implements ContextEngine {
         return safeFallback();
       }
 
-      this.deps.log.debug(
-        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens} duration=${formatDurationMs(Date.now() - startedAt)}`,
+      // v4.2 §B — surface stub telemetry on the standard "assemble: done" line
+      // so live watchers can grep stubbedCount/tokensSaved without needing the
+      // full assemble-debug bag.
+      const stubStatsLog = assembled.debug?.stubStats
+        ? ` stubbed=${assembled.debug.stubStats.stubbedCount} tokensSaved=${assembled.debug.stubStats.tokensSaved}`
+        : "";
+      this.deps.log.info(
+        `[lcm] assemble: done conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} hasSummaryItems=${hasSummaryItems} inputMessages=${params.messages.length} outputMessages=${assembled.messages.length} tokenBudget=${tokenBudget} estimatedTokens=${assembled.estimatedTokens}${stubStatsLog} duration=${formatDurationMs(Date.now() - startedAt)}`,
       );
       const prefixChange = describeAssembledPrefixChange(
         this.getPreviousAssembledSnapshot(conversation.conversationId),
