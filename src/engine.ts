@@ -5204,6 +5204,34 @@ export class LcmContextEngine implements ContextEngine {
             offset: checkpoint.lastProcessedOffset,
           });
           if (appended.canUseAppendOnly) {
+            const placeholderCheckpoint =
+              checkpoint.lastSeenSize === 0 &&
+              checkpoint.lastSeenMtimeMs === 0 &&
+              checkpoint.lastProcessedOffset === 0 &&
+              checkpoint.lastProcessedEntryHash === null;
+            if (placeholderCheckpoint && appended.messages.length > 0) {
+              const reconcile = await this.reconcileSessionTail({
+                sessionId: params.sessionId,
+                sessionKey: params.sessionKey,
+                conversationId: conversation.conversationId,
+                historicalMessages: appended.messages,
+                noAnchorImportReason: "placeholder-checkpoint-recovery",
+              });
+              if (reconcile.importedMessages > 0) {
+                this.clearStableOrphanStrippingOrdinal(conversation.conversationId);
+                this.recordRecentBootstrapImport(
+                  conversation.conversationId,
+                  reconcile.importedMessages,
+                  "reconciled missing session messages",
+                );
+                await this.refreshBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFile: params.sessionFile,
+                });
+              }
+              return reconcile;
+            }
+
             const replayFilteredMessages = await this.filterBootstrapReplayMessages({
               messages: appended.messages,
               sessionContext: this.formatSessionLogContext({
@@ -5297,9 +5325,48 @@ export class LcmContextEngine implements ContextEngine {
         const historicalMessages = await readLeafPathMessages(params.sessionFile);
         if (historicalMessages.length === 0) {
           if (!sessionFileState) {
-            this.deps.log.warn(
-              `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence without checkpoint refresh conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
-            );
+            // #649 added this permissive stat-fail fallback expecting the
+            // afterTurn-tail `refreshAfterTurnBootstrapState` hook to refresh
+            // the checkpoint. That hook delegates to refreshBootstrapState,
+            // which itself calls `stat(sessionFile)` and throws on failure;
+            // the hook's catch then logs a warn and leaves
+            // conversation_bootstrap_state NULL. Subsequent turns re-enter
+            // the slow path with reason="checkpoint-missing" (excluded from
+            // allowNoAnchorImport) and the conversation gets stuck in a
+            // transparent-passthrough state where compaction never runs.
+            //
+            // Seed a placeholder bootstrap_state row ONLY when no checkpoint
+            // already exists. If a valid checkpoint is present (with a
+            // non-zero offset), a transient stat/read failure must NOT reset
+            // it to zero — that would cause the next successful read to
+            // replay every message from offset=0, duplicating rows in the
+            // messages table (identity_hash is not a uniqueness guard).
+            if (!checkpoint) {
+              try {
+                await this.summaryStore.upsertConversationBootstrapState({
+                  conversationId: conversation.conversationId,
+                  sessionFilePath: params.sessionFile,
+                  lastSeenSize: 0,
+                  lastSeenMtimeMs: 0,
+                  lastProcessedOffset: 0,
+                  lastProcessedEntryHash: null,
+                });
+              } catch (seedError) {
+                this.deps.log.warn(
+                  `[lcm] afterTurn: transcript reconcile slow path failed to seed placeholder bootstrap_state conversation=${conversation.conversationId} sessionFile=${params.sessionFile} error=${seedError instanceof Error ? seedError.message : String(seedError)}`,
+                );
+              }
+              this.deps.log.warn(
+                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; allowing live afterTurn persistence and seeding placeholder bootstrap_state at offset=0 to unblock next-turn recovery conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+              );
+            } else {
+              // Checkpoint exists with a valid offset — a transient stat/read
+              // failure must NOT overwrite it. Leave the existing checkpoint
+              // intact so the next successful read resumes from the right offset.
+              this.deps.log.warn(
+                `[lcm] afterTurn: transcript reconcile slow path could not stat/read transcript; preserving existing checkpoint (offset=${checkpoint.lastProcessedOffset}) instead of reseeding conversation=${conversation.conversationId} sessionFile=${params.sessionFile}`,
+              );
+            }
             return {
               importedMessages: 0,
               blockedByImportCap: false,

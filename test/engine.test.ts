@@ -7930,6 +7930,163 @@ describe("LcmContextEngine fidelity and token budget", () => {
     expect(secondSlowPathWarns.length).toBe(0);
   });
 
+  it("seeds placeholder bootstrap_state when afterTurn stat-fail fallback runs (#649 follow-up)", async () => {
+    // #649 added a permissive stat-fail fallback in the slow path that
+    // returns hasOverlap:true to allow live afterTurn ingest even when the
+    // transcript cannot be stat-ed. It assumed the afterTurn-tail
+    // refreshAfterTurnBootstrapState hook would persist the checkpoint, but
+    // that hook delegates to refreshBootstrapState, which itself stat()s and
+    // throws on failure; the catch then logs a warn and leaves
+    // conversation_bootstrap_state NULL. Every subsequent afterTurn then
+    // re-enters the slow path with reason="checkpoint-missing" (excluded
+    // from allowNoAnchorImport), the slow path returns hasOverlap:false +
+    // 0 imports, and the outer transcriptReconcileUnsafeToAdvance guard
+    // skips the ingest batch. The conversation gets stuck in a
+    // transparent-passthrough state where assemble() falls back to
+    // params.messages and compaction never runs (LCM effectively becomes a
+    // no-op for that conversation).
+    //
+    // Observed in production: a long-running session got stuck in this
+    // state for ~11 hours before auto-healing when the host runtime
+    // rewrote the JSONL small enough to flip the slow-path reason to
+    // `same-path-shrink`, which IS in the allowNoAnchorImport whitelist.
+    //
+    // Fix: seed a placeholder bootstrap_state row directly (no stat call)
+    // anchored to the current sessionFile with `lastProcessedOffset=0`.
+    // On the next afterTurn whose stat() succeeds, the placeholder recovery
+    // path re-walks from offset=0 but reconciles against the DB frontier so
+    // already-ingested live afterTurn messages are not duplicated.
+    const warnLog = vi.fn();
+    const engine = createEngineWithDeps(
+      {},
+      {
+        log: { info: vi.fn(), warn: warnLog, error: vi.fn(), debug: vi.fn() },
+      },
+    );
+    const sessionId = "after-turn-stat-fail-checkpoint-seed";
+    const sessionKey = "agent:main:test:after-turn-stat-fail-checkpoint-seed";
+
+    // Prime a conversation row WITHOUT a bootstrap_state row by ingesting
+    // one message directly. This matches the production incident shape
+    // (one message already in the DB but the very first afterTurn
+    // slow-path hit stat() failure and never persisted a bootstrap_state
+    // row).
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: makeMessage({ role: "user", content: "primer" }),
+    });
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+    const preState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(preState).toBeNull();
+
+    // First turn: transcript file does not exist yet. stat() will throw
+    // ENOENT, readLeafPathMessages() will return []. This must NOT leave
+    // the conversation in checkpoint-missing deadlock state.
+    const sessionFile = createSessionFilePath("after-turn-stat-fail-checkpoint-seed");
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [
+        makeMessage({ role: "user", content: "first user turn" }),
+        makeMessage({ role: "assistant", content: "first assistant turn" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    // Placeholder checkpoint must exist pointing at the current sessionFile
+    // with offset=0 so the next turn can recover from the beginning.
+    const seededState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(seededState).not.toBeNull();
+    expect(seededState?.sessionFilePath).toBe(sessionFile);
+    expect(seededState?.lastProcessedOffset).toBe(0);
+    expect(seededState?.lastSeenSize).toBe(0);
+
+    const statFailWarn = warnLog.mock.calls
+      .map((c) => String(c[0]))
+      .find((m) => m.includes("could not stat/read transcript"));
+    expect(statFailWarn).toBeDefined();
+    expect(statFailWarn).toContain("seeding placeholder bootstrap_state at offset=0");
+
+    // Second turn: transcript now exists with real content. Placeholder
+    // recovery should read from offset=0 but only ingest messages after the
+    // already-stored frontier.
+    writeLeafTranscript(sessionFile, [
+      { role: "user", content: "first user turn" },
+      { role: "assistant", content: "first assistant turn" },
+      { role: "user", content: "second user turn" },
+      { role: "assistant", content: "second assistant turn" },
+    ]);
+    warnLog.mockClear();
+    await engine.afterTurn({
+      sessionId,
+      sessionKey,
+      sessionFile,
+      messages: [makeMessage({ role: "assistant", content: "second assistant turn" })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4_096,
+    });
+
+    // Without the checkpoint seed, ingestion stays at 0 messages forever.
+    // With placeholder recovery, only genuinely missing transcript messages
+    // are imported; the first turn was already persisted by the live
+    // afterTurn batch and must not be replayed from offset=0.
+    const messages = await engine
+      .getConversationStore()
+      .getMessages(conversation!.conversationId);
+    const contents = messages.map((m) => m.content);
+    expect(contents).toContain("first user turn");
+    expect(contents).toContain("first assistant turn");
+    expect(contents).toContain("second user turn");
+    expect(contents).toContain("second assistant turn");
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(conversation!.conversationId, "user", "first user turn"),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(
+          conversation!.conversationId,
+          "assistant",
+          "first assistant turn",
+        ),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(conversation!.conversationId, "user", "second user turn"),
+    ).resolves.toBe(1);
+    await expect(
+      engine
+        .getConversationStore()
+        .countMessagesByIdentity(
+          conversation!.conversationId,
+          "assistant",
+          "second assistant turn",
+        ),
+    ).resolves.toBe(1);
+
+    // After successful ingest, checkpoint should be advanced past offset=0
+    // (via the fast-path refreshBootstrapState call).
+    const advancedState = await engine
+      .getSummaryStore()
+      .getConversationBootstrapState(conversation!.conversationId);
+    expect(advancedState).not.toBeNull();
+    expect(advancedState?.lastProcessedOffset).toBeGreaterThan(0);
+  });
+
   it("bootstrap imports a bounded path-mismatched transcript with no old anchor as a new epoch", async () => {
     const engine = createEngine();
     const sessionId = "bootstrap-transcript-epoch-no-anchor";
