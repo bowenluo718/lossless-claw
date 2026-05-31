@@ -7,7 +7,7 @@
 import { join } from "node:path";
 import { writeFile } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
-import type { OpenClawPluginApi } from "../openclaw-bridge.js";
+import type { ContextEngineFactory, OpenClawPluginApi } from "../openclaw-bridge.js";
 import { resolveLcmConfigWithDiagnostics, resolveOpenclawStateDir } from "../db/config.js";
 import type { LcmConfig } from "../db/config.js";
 import { closeLcmConnection, createLcmDatabaseConnection, normalizePath } from "../db/connection.js";
@@ -27,6 +27,12 @@ import type {
   RuntimeLlmModelOverride,
   StartupSessionFileCandidate,
 } from "../types.js";
+
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.5.22";
+
+type ContextEngineCapableOpenClawPluginApi = OpenClawPluginApi & {
+  registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
+};
 
 /** Parse `agent:<agentId>:<suffix...>` session keys. */
 function parseAgentSessionKey(sessionKey: string): { agentId: string; suffix: string } | null {
@@ -332,6 +338,67 @@ function toPluginConfig(value: unknown): Record<string, unknown> | undefined {
 /** Narrow unknown values to plain object records. */
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Return a host version label from known runtime/API version surfaces when available. */
+function readOpenClawHostVersion(api: OpenClawPluginApi): string {
+  const runtime = isRecord(api.runtime) ? api.runtime : undefined;
+  const runtimeGateway = isRecord(runtime?.gateway) ? runtime.gateway : undefined;
+  const apiRecord = api as Record<string, unknown>;
+  const candidates = [
+    runtime?.openclawVersion,
+    runtime?.hostVersion,
+    runtime?.gatewayVersion,
+    runtime?.version,
+    runtimeGateway?.version,
+    apiRecord.openclawVersion,
+    apiRecord.hostVersion,
+    apiRecord.gatewayVersion,
+    apiRecord.version,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") {
+      continue;
+    }
+    const trimmed = candidate.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return "unknown";
+}
+
+/** Log compatibility failures without relying on the newer context-engine API. */
+function logOpenClawCompatibilityError(api: OpenClawPluginApi, message: string): void {
+  const runtime = isRecord(api.runtime) ? api.runtime : undefined;
+  const logging = isRecord(runtime?.logging) ? runtime.logging : undefined;
+  if (typeof logging?.getChildLogger === "function") {
+    const childLogger = logging.getChildLogger({ plugin: "lossless-claw" });
+    if (isRecord(childLogger) && typeof childLogger.error === "function") {
+      childLogger.error(message);
+      return;
+    }
+  }
+
+  if (isRecord(api.logger) && typeof api.logger.error === "function") {
+    api.logger.error(message);
+  }
+}
+
+/** Fail before DB init when the host lacks the required context-engine API. */
+function assertContextEngineRegistrationAvailable(
+  api: OpenClawPluginApi,
+): asserts api is ContextEngineCapableOpenClawPluginApi {
+  if (typeof api.registerContextEngine === "function") {
+    return;
+  }
+
+  const message =
+    `[lcm] Unsupported OpenClaw plugin API: lossless-claw requires OpenClaw >=${MIN_CONTEXT_ENGINE_OPENCLAW_VERSION} ` +
+    `with api.registerContextEngine; detectedHost=${readOpenClawHostVersion(api)}; ` +
+    "upgrade OpenClaw or disable lossless-claw.";
+  logOpenClawCompatibilityError(api, message);
+  throw new Error(message);
 }
 
 /** Resolve plugin config from direct runtime injection or the root OpenClaw config fallback. */
@@ -1363,7 +1430,7 @@ function createLcmDependencies(
  * OpenClaw plugin API using shared init closures.
  */
 function wirePluginHandlers(
-  api: OpenClawPluginApi,
+  api: ContextEngineCapableOpenClawPluginApi,
   deps: LcmDependencies,
   shared: SharedLcmInit,
 ): void {
@@ -1440,6 +1507,7 @@ const lcmPlugin = {
   },
 
   register(api: OpenClawPluginApi) {
+    assertContextEngineRegistrationAvailable(api);
     const registrationConfig = resolveRegistrationConfig(api);
     const deps = createLcmDependencies(api, registrationConfig);
     const dbPath = deps.config.databasePath;

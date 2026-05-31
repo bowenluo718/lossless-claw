@@ -96,7 +96,7 @@ export type OpenClawPluginApi = {
   logger?: any;
   log?: any;
   registerCommand: (definition: OpenClawPluginCommandDefinition) => void;
-  registerContextEngine: (id: string, factory: ContextEngineFactory) => void;
+  registerContextEngine?: (id: string, factory: ContextEngineFactory) => void;
   [key: string]: any;
 };
 

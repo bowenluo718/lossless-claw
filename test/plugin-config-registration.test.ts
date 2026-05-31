@@ -244,6 +244,23 @@ describe("lcm plugin registration", () => {
     ]);
   });
 
+  it("fails fast with a compatibility diagnostic when context-engine registration is unavailable", () => {
+    const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
+    dbPaths.add(dbPath);
+    const createSpy = vi.spyOn(connectionModule, "createLcmDatabaseConnection");
+    const { api, errorLog } = buildApi({ enabled: true, dbPath });
+    (api.runtime as Record<string, unknown>).openclawVersion = "2026.5.1";
+    delete (api as unknown as { registerContextEngine?: unknown }).registerContextEngine;
+
+    expect(() => lcmPlugin.register(api)).toThrow(
+      /requires OpenClaw >=2026\.5\.22 with api\.registerContextEngine/,
+    );
+    expect(createSpy).not.toHaveBeenCalled();
+    expect(api.registerCommand).not.toHaveBeenCalled();
+    expect(api.registerTool).not.toHaveBeenCalled();
+    expect(errorLog).toHaveBeenCalledWith(expect.stringContaining("detectedHost=2026.5.1"));
+  });
+
   it("uses api.pluginConfig values during register", { timeout: 20000 }, () => {
     const dbPath = join(tmpdir(), `lossless-claw-${Date.now()}-${Math.random().toString(16)}.db`);
     dbPaths.add(dbPath);
