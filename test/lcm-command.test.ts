@@ -227,6 +227,8 @@ describe("lcm command", () => {
     expect(result.text).toContain("summarized source tokens: 21");
     expect(result.text).toContain("tokens in context: 5");
     expect(result.text).toContain("compression ratio: 1:6");
+    expect(result.text).toContain("lcm health: healthy");
+    expect(result.text).toContain("transport health: not assessed by Lossless Claw");
     expect(result.text).toContain("doctor: 1 issue(s) in this conversation");
   });
 
@@ -886,11 +888,179 @@ describe("lcm command", () => {
     );
 
     expect(result.text).toContain("**🛠️ Maintenance**");
+    expect(result.text).toContain("lcm health: degraded");
+    expect(result.text).toContain("transport health: not assessed by Lossless Claw");
+    expect(result.text).toContain("lcm reason: compaction maintenance is pending (budget-trigger)");
+    expect(result.text).toContain("lcm reason: last maintenance failure: provider timeout");
     expect(result.text).toContain("state: pending");
     expect(result.text).toContain("reason: budget-trigger");
     expect(result.text).toContain("last failure: provider timeout");
     expect(result.text).toContain("requested token budget: 128,000");
     expect(result.text).toContain("observed token count: 96,000");
+  });
+
+  it("reports LCM token pressure separately from transport health in status output", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    fixture.config.maxAssemblyTokenBudget = 100;
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "status-token-pressure-session",
+      sessionKey: "agent:main:telegram:pressure:1",
+      title: "Token pressure fixture",
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "large active context",
+        tokenCount: 130,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "status_pressure_leaf",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "pressure summary",
+      tokenCount: 130,
+      sourceMessageTokenCount: 130,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("status_pressure_leaf", [message.messageId]);
+    await fixture.summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "status_pressure_leaf",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        sessionKey: "agent:main:telegram:pressure:1",
+        sessionId: "status-token-pressure-session",
+      }),
+    );
+
+    expect(result.text).toContain("lcm health: degraded");
+    expect(result.text).toContain("transport health: not assessed by Lossless Claw");
+    expect(result.text).toContain(
+      "lcm reason: observed token count 130 exceeds assembly budget 100",
+    );
+  });
+
+  it("warns when repair-source pressure would block doctor apply even if active context is small", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    fixture.config.maxAssemblyTokenBudget = 128_000;
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "status-repair-pressure-session",
+      sessionKey: "agent:main:telegram:repair-pressure:1",
+      title: "Repair pressure fixture",
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "oversized raw repair source",
+        tokenCount: 120_000,
+      },
+    ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "status_repair_pressure_leaf",
+      conversationId: conversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "small active summary",
+      tokenCount: 8,
+      sourceMessageTokenCount: 120_000,
+    });
+    await fixture.summaryStore.linkSummaryToMessages("status_repair_pressure_leaf", [message.messageId]);
+    await fixture.summaryStore.replaceContextRangeWithSummary({
+      conversationId: conversation.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 0,
+      summaryId: "status_repair_pressure_leaf",
+    });
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        sessionKey: "agent:main:telegram:repair-pressure:1",
+        sessionId: "status-repair-pressure-session",
+      }),
+    );
+
+    expect(result.text).toContain("tokens in context: 8");
+    expect(result.text).toContain("lcm health: warning");
+    expect(result.text).toContain(
+      "lcm reason: repair source token count 120,000 exceeds 75% of assembly budget 128,000",
+    );
+  });
+
+  it("does not treat stale idle maintenance token counts as degraded status", async () => {
+    const fixture = createCommandFixture();
+    tempDirs.add(fixture.tempDir);
+    dbPaths.add(fixture.dbPath);
+    fixture.config.maxAssemblyTokenBudget = 100;
+
+    const conversation = await fixture.conversationStore.createConversation({
+      sessionId: "status-idle-stale-maintenance-session",
+      sessionKey: "agent:main:telegram:idle-maintenance:1",
+      title: "Idle maintenance fixture",
+    });
+    const [message] = await fixture.conversationStore.createMessagesBulk([
+      {
+        conversationId: conversation.conversationId,
+        seq: 0,
+        role: "user",
+        content: "small active context",
+        tokenCount: 8,
+      },
+    ]);
+    await fixture.summaryStore.appendContextMessages(conversation.conversationId, [message.messageId]);
+    fixture.db
+      .prepare(
+        `INSERT INTO conversation_compaction_maintenance (
+           conversation_id,
+           pending,
+           requested_at,
+           reason,
+           running,
+           last_started_at,
+           last_finished_at,
+           token_budget,
+           current_token_count,
+           projected_token_count,
+           updated_at
+         ) VALUES (?, 0, ?, ?, 0, ?, ?, ?, ?, ?, datetime('now'))`,
+      )
+      .run(
+        conversation.conversationId,
+        "2026-04-12T00:00:00.000Z",
+        "threshold",
+        "2026-04-12T00:05:00.000Z",
+        "2026-04-12T00:07:00.000Z",
+        100,
+        150,
+        150,
+      );
+
+    const result = await fixture.command.handler(
+      createCommandContext(undefined, {
+        sessionKey: "agent:main:telegram:idle-maintenance:1",
+        sessionId: "status-idle-stale-maintenance-session",
+      }),
+    );
+
+    expect(result.text).toContain("tokens in context: 8");
+    expect(result.text).toContain("state: idle");
+    expect(result.text).toContain("observed token count: 150");
+    expect(result.text).toContain("lcm health: healthy");
+    expect(result.text).not.toContain("lcm reason: observed token count 150");
   });
 
   it("falls back to the active session id when the current session key is not stored yet", async () => {

@@ -58,6 +58,7 @@ import {
 } from "./store/compaction-telemetry-store.js";
 import {
   CompactionMaintenanceStore,
+  type ConversationCompactionMaintenanceRecord,
 } from "./store/compaction-maintenance-store.js";
 import {
   ConversationStore,
@@ -108,6 +109,7 @@ type BootstrapImportObservation = {
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
 const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
+const DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO = 0.75;
 type CircuitBreakerState = {
   failures: number;
   openSince: number | null;
@@ -3049,6 +3051,68 @@ function trimMessagesToBudget(messages: AgentMessage[], tokenBudget: number): Ag
   return stripTrailingAssistantPrefill(
     trimBootstrapMessagesToBudget(messages, Math.max(0, Math.floor(tokenBudget))),
   );
+}
+
+function isProtectedLeadingLiveContextMessage(message: AgentMessage): boolean {
+  const role = typeof message.role === "string" ? message.role.toLowerCase() : "";
+  return role === "system" || role === "developer";
+}
+
+function buildDegradedLiveAssembleResult(params: {
+  liveMessages: AgentMessage[];
+  tokenBudget: number;
+}): AssembleResult {
+  const withoutAssistantPrefill = stripTrailingAssistantPrefill(params.liveMessages.slice());
+  const protectedPrefix: AgentMessage[] = [];
+  while (
+    protectedPrefix.length < withoutAssistantPrefill.length &&
+    isProtectedLeadingLiveContextMessage(withoutAssistantPrefill[protectedPrefix.length]!)
+  ) {
+    protectedPrefix.push(withoutAssistantPrefill[protectedPrefix.length]!);
+  }
+  const liveTail = withoutAssistantPrefill.slice(protectedPrefix.length);
+  const remainingBudget = Math.max(
+    0,
+    Math.floor(params.tokenBudget) - estimateAgentMessageTokens(protectedPrefix),
+  );
+  let liveTailMessages = trimMessagesToBudget(liveTail, remainingBudget);
+  if (liveTailMessages.length === 0 && liveTail.length > 0) {
+    liveTailMessages = [liveTail[liveTail.length - 1]!];
+  }
+  const messages = [...protectedPrefix, ...liveTailMessages];
+  return {
+    messages,
+    estimatedTokens: estimateAgentMessageTokens(messages),
+  };
+}
+
+function resolveDeferredAssemblyPressure(params: {
+  liveContextTokens: number;
+  maintenance: ConversationCompactionMaintenanceRecord | null;
+}): {
+  observedContextTokens: number;
+  projectedTokenCount: number | null;
+  pressureTokenCount: number;
+} {
+  const recordedContextTokens = normalizeNonNegativeInteger(
+    params.maintenance?.currentTokenCount,
+  );
+  const recordedProjectedTokens = normalizeNonNegativeInteger(
+    params.maintenance?.projectedTokenCount,
+  );
+  const observedContextTokens = Math.max(
+    params.liveContextTokens,
+    recordedContextTokens ?? 0,
+  );
+  const pressureTokenCount = Math.max(
+    observedContextTokens,
+    recordedProjectedTokens ?? 0,
+  );
+  return {
+    observedContextTokens,
+    projectedTokenCount: recordedProjectedTokens ?? null,
+    pressureTokenCount,
+  };
 }
 
 function buildForkBoundedLiveFallback(params: {
@@ -8174,24 +8238,23 @@ export class LcmContextEngine implements ContextEngine {
       const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
         conversation.conversationId,
       );
+      let deferredAssemblyDegradation:
+        | {
+            reason: "near-budget" | "emergency-debt-still-pending";
+            pressure: ReturnType<typeof resolveDeferredAssemblyPressure>;
+          }
+        | null = null;
       if (maintenance?.pending || maintenance?.running) {
-        const recordedContextTokens = this.normalizeObservedTokenCount(
-          maintenance.currentTokenCount ?? undefined,
+        const pressureThreshold = Math.floor(
+          tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO,
         );
-        const recordedProjectedTokens = this.normalizeObservedTokenCount(
-          maintenance.projectedTokenCount ?? undefined,
-        );
-        const observedEmergencyContextTokens = Math.max(
+        let pressure = resolveDeferredAssemblyPressure({
           liveContextTokens,
-          recordedContextTokens ?? 0,
-        );
-        const emergencyContextTokens = Math.max(
-          observedEmergencyContextTokens,
-          recordedProjectedTokens ?? 0,
-        );
-        if (emergencyContextTokens > tokenBudget) {
+          maintenance,
+        });
+        if (pressure.pressureTokenCount > tokenBudget) {
           this.deps.log.warn(
-            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${observedEmergencyContextTokens} projectedTokenCount=${recordedProjectedTokens ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
+            `[lcm] assemble: emergency deferred compaction debt draining pre-assembly conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=over-budget`,
           );
           try {
             await this.maybeConsumeDeferredCompactionDebtForAssemble({
@@ -8199,18 +8262,49 @@ export class LcmContextEngine implements ContextEngine {
               sessionId: params.sessionId,
               sessionKey: params.sessionKey,
               tokenBudget,
-              currentTokenCount: observedEmergencyContextTokens,
+              currentTokenCount: pressure.observedContextTokens,
             });
           } catch (error) {
             this.deps.log.warn(
               `[lcm] assemble: deferred compaction execution failed for ${sessionLabel}: ${describeLogError(error)}`,
             );
           }
+          const latestMaintenance =
+            await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+              conversation.conversationId,
+            );
+          if (latestMaintenance?.pending || latestMaintenance?.running) {
+            pressure = resolveDeferredAssemblyPressure({
+              liveContextTokens,
+              maintenance: latestMaintenance,
+            });
+            if (pressure.pressureTokenCount > pressureThreshold) {
+              deferredAssemblyDegradation = {
+                reason: "emergency-debt-still-pending",
+                pressure,
+              };
+            }
+          }
+        } else if (pressure.pressureTokenCount > pressureThreshold) {
+          deferredAssemblyDegradation = {
+            reason: "near-budget",
+            pressure,
+          };
         } else {
           this.deps.log.debug(
-            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${observedEmergencyContextTokens} projectedTokenCount=${recordedProjectedTokens ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
+            `[lcm] assemble: deferred compaction debt left pending conversation=${conversation.conversationId} ${sessionLabel} currentTokenCount=${pressure.observedContextTokens} projectedTokenCount=${pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} reason=not-over-budget`,
           );
         }
+      }
+      if (deferredAssemblyDegradation) {
+        const degraded = buildDegradedLiveAssembleResult({
+          liveMessages: params.messages,
+          tokenBudget,
+        });
+        this.deps.log.warn(
+          `[lcm] assemble: degraded live fallback conversation=${conversation.conversationId} ${sessionLabel} reason=${deferredAssemblyDegradation.reason} currentTokenCount=${deferredAssemblyDegradation.pressure.observedContextTokens} projectedTokenCount=${deferredAssemblyDegradation.pressure.projectedTokenCount ?? "null"} tokenBudget=${tokenBudget} pressureThreshold=${Math.floor(tokenBudget * DEFERRED_ASSEMBLY_DEGRADED_PRESSURE_RATIO)} outputMessages=${degraded.messages.length} estimatedTokens=${degraded.estimatedTokens}`,
+        );
+        return degraded;
       }
 
       const bootstrapState = await this.summaryStore.getConversationBootstrapState(

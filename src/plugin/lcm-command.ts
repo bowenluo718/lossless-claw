@@ -652,6 +652,61 @@ function buildDoctorApplySafetyPreflight(params: {
   };
 }
 
+function buildLcmHealthSummary(params: {
+  config: LcmConfig;
+  stats: LcmConversationStatusStats;
+  maintenance: ConversationCompactionMaintenanceRecord | null;
+}): { state: "healthy" | "warning" | "degraded"; reasons: string[] } {
+  const tokenBudget = resolveLifecycleCompactionTokenBudget(params.config);
+  const warningThreshold = Math.floor(tokenBudget * DOCTOR_APPLY_BUDGET_PRESSURE_RATIO);
+  const activeMaintenance = params.maintenance?.pending || params.maintenance?.running;
+  const assemblyObservedTokens = Math.max(
+    params.stats.contextTokenCount,
+    activeMaintenance ? params.maintenance?.currentTokenCount ?? 0 : 0,
+    activeMaintenance ? params.maintenance?.projectedTokenCount ?? 0 : 0,
+  );
+  const repairSurfaceTokens = Math.max(
+    params.stats.summarizedSourceTokens,
+    params.stats.compressedTokenCount,
+  );
+  const degradedReasons: string[] = [];
+  const warningReasons: string[] = [];
+
+  if (params.maintenance?.running) {
+    degradedReasons.push("compaction maintenance is running");
+  }
+  if (params.maintenance?.pending) {
+    degradedReasons.push(
+      `compaction maintenance is pending (${params.maintenance.reason ?? "reason unknown"})`,
+    );
+  }
+  if (assemblyObservedTokens > tokenBudget) {
+    degradedReasons.push(
+      `observed token count ${formatNumber(assemblyObservedTokens)} exceeds assembly budget ${formatNumber(tokenBudget)}`,
+    );
+  } else if (assemblyObservedTokens > warningThreshold) {
+    warningReasons.push(
+      `observed token count ${formatNumber(assemblyObservedTokens)} exceeds ${formatNumber(Math.round(DOCTOR_APPLY_BUDGET_PRESSURE_RATIO * 100))}% of assembly budget ${formatNumber(tokenBudget)}`,
+    );
+  }
+  if (repairSurfaceTokens > warningThreshold) {
+    warningReasons.push(
+      `repair source token count ${formatNumber(repairSurfaceTokens)} exceeds ${formatNumber(Math.round(DOCTOR_APPLY_BUDGET_PRESSURE_RATIO * 100))}% of assembly budget ${formatNumber(tokenBudget)}`,
+    );
+  }
+  if (params.maintenance?.lastFailureSummary) {
+    warningReasons.push(`last maintenance failure: ${params.maintenance.lastFailureSummary}`);
+  }
+
+  if (degradedReasons.length > 0) {
+    return { state: "degraded", reasons: [...degradedReasons, ...warningReasons] };
+  }
+  if (warningReasons.length > 0) {
+    return { state: "warning", reasons: warningReasons };
+  }
+  return { state: "healthy", reasons: [] };
+}
+
 // Run the cache-aware focus lifecycle sweep. Focus and unfocus both mutate the
 // prompt prefix, so they explicitly take the manual full-sweep path and bypass
 // threshold skips instead of leaving compaction to normal background policy.
@@ -896,6 +951,11 @@ async function buildStatusText(params: {
       params.db,
       current.stats.conversationId,
     );
+    const lcmHealth = buildLcmHealthSummary({
+      config: params.config,
+      stats: current.stats,
+      maintenance,
+    });
     const focusLines = await buildFocusSummaryLines({
       store: new FocusBriefStore(params.db),
       conversationId: current.stats.conversationId,
@@ -922,6 +982,9 @@ async function buildStatusText(params: {
           "compression ratio",
           formatCompressionRatio(current.stats.contextTokenCount, current.stats.compressedTokenCount),
         ),
+        buildStatLine("lcm health", lcmHealth.state),
+        buildStatLine("transport health", "not assessed by Lossless Claw"),
+        ...lcmHealth.reasons.map((reason) => buildStatLine("lcm reason", reason)),
         buildStatLine(
           "doctor",
           conversationDoctor.total > 0
