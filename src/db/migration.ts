@@ -325,6 +325,25 @@ function ensureMessageLargeContentColumn(db: DatabaseSync): void {
   }
 }
 
+function ensureConversationBootstrapStateForkColumns(db: DatabaseSync): void {
+  const columns = db
+    .prepare(`PRAGMA table_info(conversation_bootstrap_state)`)
+    .all() as SummaryColumnInfo[];
+  const hasForkBounded = columns.some((col) => col.name === "fork_bounded");
+  const hasForkSourceMessageCount = columns.some(
+    (col) => col.name === "fork_source_message_count",
+  );
+
+  if (!hasForkBounded) {
+    db.exec(`ALTER TABLE conversation_bootstrap_state ADD COLUMN fork_bounded INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!hasForkSourceMessageCount) {
+    db.exec(
+      `ALTER TABLE conversation_bootstrap_state ADD COLUMN fork_source_message_count INTEGER NOT NULL DEFAULT 0`,
+    );
+  }
+}
+
 function backfillMessageIdentityHashes(
   db: DatabaseSync,
   options?: { managesOwnTransaction?: boolean },
@@ -1022,6 +1041,8 @@ export function runLcmMigrations(
       last_seen_mtime_ms INTEGER NOT NULL,
       last_processed_offset INTEGER NOT NULL,
       last_processed_entry_hash TEXT,
+      fork_bounded INTEGER NOT NULL DEFAULT 0,
+      fork_source_message_count INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
 
@@ -1174,6 +1195,9 @@ export function runLcmMigrations(
     // stratification. Idempotent additive ALTER; safe across versions.
     runMigrationStep("ensureMessageLargeContentColumn", log, () =>
       ensureMessageLargeContentColumn(db),
+    );
+    runMigrationStep("ensureConversationBootstrapStateForkColumns", log, () =>
+      ensureConversationBootstrapStateForkColumns(db),
     );
     // Belt-and-suspenders: ensure message_parts exists even if the bulk
     // CREATE TABLE block above was interrupted before reaching it.

@@ -379,6 +379,14 @@ describe("LcmContextEngine metadata", () => {
     });
   });
 
+  it("requires host thread bootstrap projection for subagent forks", () => {
+    const engine = createEngine();
+    expect(engine.info.hostRequirements?.["subagent-spawn"]).toEqual({
+      requiredCapabilities: ["thread-bootstrap-projection"],
+      unsupportedMessage: expect.stringContaining("raw parent JSONL branch"),
+    });
+  });
+
   it("configures file-backed sqlite connections with WAL and busy_timeout", () => {
     const tempDir = mkdtempSync(join(tmpdir(), "lossless-claw-db-"));
     tempDirs.push(tempDir);
@@ -6444,6 +6452,91 @@ describe("LcmContextEngine.bootstrap", () => {
     ]);
   });
 
+  it("bounds forked child bootstrap and assembly even when the host transcript contains a raw parent branch", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-fork-token-cap");
+    const header = {
+      type: "session",
+      version: 3,
+      id: "forked-child-session",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+      parentSession: "/state/sessions/parent.jsonl",
+    };
+    const forkedParentBranch = Array.from({ length: 60 }, (_, index) => ({
+      type: "message",
+      id: `parent-${index}`,
+      parentId: index === 0 ? null : `parent-${index - 1}`,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: index % 2 === 0 ? "user" : "assistant",
+        content: [{ type: "text", text: `fork parent turn ${index} ${"x".repeat(240)}` }],
+      },
+    }));
+    writeFileSync(
+      sessionFile,
+      [header, ...forkedParentBranch].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 320 });
+    const sessionId = "bootstrap-fork-token-cap";
+    const sessionKey = "agent:main:discord:channel:child-thread";
+    const result = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+
+    expect(result.bootstrapped).toBe(true);
+    expect(result.importedMessages).toBeLessThan(60);
+    expect(result.importedMessages).toBeGreaterThan(0);
+
+    const conversation = await engine.getConversationStore().getConversationForSession({
+      sessionId,
+      sessionKey,
+    });
+    expect(conversation).not.toBeNull();
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.length).toBe(result.importedMessages);
+    expect(stored[0]?.content).not.toContain("fork parent turn 0");
+    expect(stored.at(-1)?.content).toContain("fork parent turn 59");
+
+    const rawDb = createLcmDatabaseConnection(engine.config.databasePath);
+    try {
+      rawDb
+        .prepare(
+          `UPDATE conversation_bootstrap_state
+           SET fork_bounded = 0, fork_source_message_count = 0
+           WHERE conversation_id = ?`,
+        )
+        .run(conversation!.conversationId);
+    } finally {
+      closeLcmConnection(rawDb);
+    }
+
+    const secondBootstrap = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+    expect(secondBootstrap.bootstrapped).toBe(false);
+
+    const restartedEngine = createEngineAtDatabasePath(engine.config.databasePath);
+    const repeatedChildPrompt = `fork parent turn 58 ${"x".repeat(240)}`;
+    const liveMessages = [
+      ...forkedParentBranch.map((entry) => entry.message as AgentMessage),
+      makeMessage({
+        role: "user",
+        content: [{ type: "text", text: repeatedChildPrompt }],
+      }),
+    ];
+    const assembled = await restartedEngine.assemble({
+      sessionId,
+      sessionKey,
+      messages: liveMessages,
+      tokenBudget: 10_000,
+    });
+    const assembledText = JSON.stringify(assembled.messages);
+
+    expect(assembled.messages.length).toBeLessThan(liveMessages.length);
+    expect(assembledText).not.toContain("fork parent turn 0");
+    expect(assembledText).toContain("fork parent turn 59");
+    expect(assembledText.split(repeatedChildPrompt).length - 1).toBeGreaterThanOrEqual(2);
+  });
+
   it("drops an oversized singleton bootstrap tail that exceeds bootstrapMaxTokens", async () => {
     const sessionFile = createSessionFilePath("bootstrap-oversized-singleton");
     const sm = SessionManager.open(sessionFile);
@@ -6464,6 +6557,55 @@ describe("LcmContextEngine.bootstrap", () => {
 
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored).toEqual([]);
+  });
+
+  it("does not return raw fork history when a forked oversized bootstrap tail imports no messages", async () => {
+    const sessionFile = createSessionFilePath("bootstrap-fork-oversized-singleton");
+    const header = {
+      type: "session",
+      version: 3,
+      id: "forked-child-oversized-session",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+      parentSession: "/state/sessions/parent.jsonl",
+    };
+    const oversizedParentMessage = {
+      type: "message",
+      id: "parent-oversized",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: {
+        role: "user",
+        content: [{ type: "text", text: `oversized fork parent ${"x".repeat(5000)}` }],
+      },
+    };
+    writeFileSync(
+      sessionFile,
+      [header, oversizedParentMessage].map((entry) => JSON.stringify(entry)).join("\n") + "\n",
+      "utf8",
+    );
+
+    const engine = createEngineWithConfig({ bootstrapMaxTokens: 100 });
+    const sessionId = "bootstrap-fork-oversized-singleton";
+    const sessionKey = "agent:main:discord:channel:oversized-child-thread";
+    const result = await engine.bootstrap({ sessionId, sessionKey, sessionFile });
+
+    expect(result.bootstrapped).toBe(false);
+    expect(result.importedMessages).toBe(0);
+
+    const assembled = await engine.assemble({
+      sessionId,
+      sessionKey,
+      messages: [
+        oversizedParentMessage.message as AgentMessage,
+        makeMessage({ role: "user", content: "fresh child prompt after oversized parent" }),
+      ],
+      tokenBudget: 10_000,
+    });
+    const assembledText = JSON.stringify(assembled.messages);
+
+    expect(assembledText).not.toContain("oversized fork parent");
+    expect(assembledText).toContain("fresh child prompt after oversized parent");
   });
 
   it("streams JSONL replay and skips malformed lines while keeping later messages", async () => {

@@ -212,6 +212,17 @@ LCM handles crash recovery through **bootstrap reconciliation**:
 
 This handles the case where OpenClaw wrote messages to the session file but crashed before LCM could persist them.
 
+For forked child sessions, LCM treats a host-copied parent JSONL branch as a
+first-time bootstrap source and imports only the newest messages that fit within
+`bootstrapMaxTokens`. That keeps child LCM state bounded even if the host fork
+payload still contains a long raw parent branch. The remaining fork-continuity
+contract belongs to the host: when lossless-claw advertises the
+`subagent-spawn` requirement for `thread-bootstrap-projection`, OpenClaw should
+bootstrap the child model thread from the context-engine projection rather than
+from the raw copied transcript. If the host cannot provide that capability,
+lossless-claw can preserve bounded durable state, but it cannot stop the host
+from replaying raw JSONL into the model before assembly.
+
 ## Operation serialization
 
 All mutating operations (ingest, compact) are serialized per-session using a promise queue. This prevents races between concurrent afterTurn/compact calls for the same conversation without blocking operations on different conversations.

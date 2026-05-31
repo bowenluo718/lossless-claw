@@ -186,6 +186,13 @@ Every automatic decision emits grep-able log lines prefixed with `[lcm] auto-rot
 | `maxAssemblyTokenBudget` | `integer` | unset | `LCM_MAX_ASSEMBLY_TOKEN_BUDGET` | Optional hard cap for assembly and threshold evaluation, useful with smaller-context models. |
 | `maxExpandTokens` | `integer` | `4000` | `LCM_MAX_EXPAND_TOKENS` | Default token cap for `lcm_expand_query` responses. |
 
+Forked child transcripts are also bounded by `bootstrapMaxTokens` when a host
+copies a raw parent JSONL branch into the child file. This protects the LCM
+database from importing unbounded parent history, but the host must still honor
+the `thread-bootstrap-projection` context-engine capability for subagent or
+thread forks so the model starts from the LCM-assembled compact view instead of
+the raw copied transcript.
+
 ### Model selection, execution, and prompts
 
 | Key | Type | Default | Env override | Purpose |

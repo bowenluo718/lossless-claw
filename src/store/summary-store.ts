@@ -118,6 +118,8 @@ export type UpsertConversationBootstrapStateInput = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash?: string | null;
+  forkBounded?: boolean;
+  forkSourceMessageCount?: number;
 };
 
 export type ConversationBootstrapStateRecord = {
@@ -127,6 +129,8 @@ export type ConversationBootstrapStateRecord = {
   lastSeenMtimeMs: number;
   lastProcessedOffset: number;
   lastProcessedEntryHash: string | null;
+  forkBounded: boolean;
+  forkSourceMessageCount: number;
   updatedAt: Date;
 };
 
@@ -230,6 +234,8 @@ interface ConversationBootstrapStateRow {
   last_seen_mtime_ms: number;
   last_processed_offset: number;
   last_processed_entry_hash: string | null;
+  fork_bounded: number;
+  fork_source_message_count: number;
   updated_at: string;
 }
 
@@ -331,6 +337,13 @@ function toConversationBootstrapStateRecord(
     lastSeenMtimeMs: row.last_seen_mtime_ms,
     lastProcessedOffset: row.last_processed_offset,
     lastProcessedEntryHash: row.last_processed_entry_hash,
+    forkBounded: row.fork_bounded === 1,
+    forkSourceMessageCount:
+      typeof row.fork_source_message_count === "number" &&
+      Number.isFinite(row.fork_source_message_count) &&
+      row.fork_source_message_count >= 0
+        ? Math.floor(row.fork_source_message_count)
+        : 0,
     updatedAt: parseUtcTimestamp(row.updated_at),
   };
 }
@@ -1547,7 +1560,8 @@ export class SummaryStore {
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, updated_at
+                last_processed_offset, last_processed_entry_hash, fork_bounded,
+                fork_source_message_count, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )
@@ -1566,15 +1580,27 @@ export class SummaryStore {
            last_seen_size,
            last_seen_mtime_ms,
            last_processed_offset,
-           last_processed_entry_hash
+           last_processed_entry_hash,
+           fork_bounded,
+           fork_source_message_count
          )
-         VALUES (?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (conversation_id) DO UPDATE SET
            session_file_path = excluded.session_file_path,
            last_seen_size = excluded.last_seen_size,
            last_seen_mtime_ms = excluded.last_seen_mtime_ms,
            last_processed_offset = excluded.last_processed_offset,
            last_processed_entry_hash = excluded.last_processed_entry_hash,
+           fork_bounded = CASE
+             WHEN excluded.fork_bounded = 1 THEN 1
+             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
+             ELSE conversation_bootstrap_state.fork_bounded
+           END,
+           fork_source_message_count = CASE
+             WHEN excluded.fork_bounded = 1 THEN excluded.fork_source_message_count
+             WHEN conversation_bootstrap_state.session_file_path != excluded.session_file_path THEN 0
+             ELSE conversation_bootstrap_state.fork_source_message_count
+           END,
            updated_at = datetime('now')`,
       )
       .run(
@@ -1584,12 +1610,15 @@ export class SummaryStore {
         Math.max(0, Math.floor(input.lastSeenMtimeMs)),
         Math.max(0, Math.floor(input.lastProcessedOffset)),
         input.lastProcessedEntryHash ?? null,
+        input.forkBounded === true ? 1 : 0,
+        Math.max(0, Math.floor(input.forkSourceMessageCount ?? 0)),
       );
 
     const row = this.db
       .prepare(
         `SELECT conversation_id, session_file_path, last_seen_size, last_seen_mtime_ms,
-                last_processed_offset, last_processed_entry_hash, updated_at
+                last_processed_offset, last_processed_entry_hash, fork_bounded,
+                fork_source_message_count, updated_at
          FROM conversation_bootstrap_state
          WHERE conversation_id = ?`,
       )

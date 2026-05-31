@@ -152,8 +152,11 @@ export type ContextEngine = {
   prepareSubagentSpawn?(params: {
     parentSessionId?: string;
     parentSessionKey?: string;
+    parentSessionFile?: string;
     childSessionId?: string;
     childSessionKey: string;
+    childSessionFile?: string;
+    contextMode?: "isolated" | "fork";
   }): Promise<SubagentSpawnPreparation | undefined>;
   onSubagentEnded?(params: {
     childSessionId?: string;

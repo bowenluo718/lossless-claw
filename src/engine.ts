@@ -89,6 +89,9 @@ const LOSSLESS_AGENT_RUN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability
   "compact",
   "runtime-llm-complete",
 ];
+const LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES: ContextEngineHostCapability[] = [
+  "thread-bootstrap-projection",
+];
 type AssemblePrefixSnapshot = {
   serializedMessages: string[];
   messageSummaries: string[];
@@ -98,10 +101,12 @@ type AssemblePrefixSnapshot = {
 type BootstrapImportObservation = {
   importedMessages: number;
   reason: string | null;
+  forkBounded: boolean;
   observedAt: Date;
 };
 
 const MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS = 100;
+const FORK_BOUNDED_BOOTSTRAP_REASON = "fork-bounded bootstrap import";
 const CONTEXT_ENGINE_PROJECTION_EPOCH_VERSION = "summary-prefix-v1";
 type CircuitBreakerState = {
   failures: number;
@@ -1677,6 +1682,40 @@ async function readLeafPathMessages(sessionFile: string): Promise<AgentMessage[]
   }
 }
 
+async function readSessionParentSessionReference(sessionFile: string): Promise<string | null> {
+  try {
+    const stream = createReadStream(sessionFile, { encoding: "utf8" });
+    const lines = createInterface({
+      input: stream,
+      crlfDelay: Infinity,
+    });
+    try {
+      for await (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) {
+          continue;
+        }
+        try {
+          const parsed = JSON.parse(trimmed) as { type?: unknown; parentSession?: unknown };
+          if (parsed.type !== "session" || typeof parsed.parentSession !== "string") {
+            return null;
+          }
+          const parentSession = parsed.parentSession.trim();
+          return parentSession.length > 0 ? parentSession : null;
+        } catch {
+          return null;
+        }
+      }
+    } finally {
+      lines.close();
+      stream.destroy();
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
 /**
  * Resolve the first-time bootstrap token budget.
  *
@@ -2071,6 +2110,14 @@ function isVolatileLiveInputContent(content: string): boolean {
 
 function estimateAgentMessageTokens(messages: AgentMessage[]): number {
   return messages.reduce((total, message) => total + toStoredMessage(message).tokenCount, 0);
+}
+
+function stripTrailingAssistantPrefill(messages: AgentMessage[]): AgentMessage[] {
+  const trimmed = messages.slice();
+  while (trimmed.length > 0 && trimmed[trimmed.length - 1]?.role === "assistant") {
+    trimmed.pop();
+  }
+  return trimmed;
 }
 
 function isVolatileLiveInputMessage(message: AgentMessage): boolean {
@@ -2951,6 +2998,158 @@ function appendUncoveredVolatileLiveInputsWithinBudget(params: {
   };
 }
 
+function resolveForkBoundedLiveSuffix(params: {
+  assembledMessages: AgentMessage[];
+  liveMessages: AgentMessage[];
+  forkSourceMessageCount: number;
+}): AgentMessage[] {
+  const liveMessages = params.liveMessages.map(normalizeLiveMessageForAssemblyReconciliation);
+  const forkSourceMessageCount = Math.max(0, Math.floor(params.forkSourceMessageCount));
+  const anchorSearchEnd =
+    forkSourceMessageCount > 0
+      ? Math.min(liveMessages.length, forkSourceMessageCount)
+      : liveMessages.length;
+  let anchorLiveIndex = -1;
+  for (let liveIndex = anchorSearchEnd - 1; liveIndex >= 0; liveIndex--) {
+    const liveMessage = liveMessages[liveIndex] as AgentMessage;
+    for (
+      let assembledIndex = params.assembledMessages.length - 1;
+      assembledIndex >= 0;
+      assembledIndex--
+    ) {
+      const assembledMessage = params.assembledMessages[assembledIndex] as AgentMessage;
+      if (messagesHaveSameLiveCoverageSignature(assembledMessage, liveMessage)) {
+        anchorLiveIndex = liveIndex;
+        break;
+      }
+    }
+    if (anchorLiveIndex >= 0) {
+      break;
+    }
+  }
+
+  if (anchorLiveIndex >= 0) {
+    return liveMessages.slice(anchorLiveIndex + 1);
+  }
+
+  if (forkSourceMessageCount > 0 && liveMessages.length >= forkSourceMessageCount) {
+    return liveMessages.slice(forkSourceMessageCount);
+  }
+
+  // If the host provides a short live snapshot rather than the copied fork
+  // branch, keep that snapshot; it is no longer the raw parent prefix.
+  if (forkSourceMessageCount > 0 && liveMessages.length < forkSourceMessageCount) {
+    return liveMessages;
+  }
+
+  return [];
+}
+
+function trimMessagesToBudget(messages: AgentMessage[], tokenBudget: number): AgentMessage[] {
+  return stripTrailingAssistantPrefill(
+    trimBootstrapMessagesToBudget(messages, Math.max(0, Math.floor(tokenBudget))),
+  );
+}
+
+function buildForkBoundedLiveFallback(params: {
+  liveMessages: AgentMessage[];
+  forkSourceMessageCount: number;
+  tokenBudget: number;
+  bootstrapMaxTokens: number;
+}): AssembleResult {
+  const suffix = resolveForkBoundedLiveSuffix({
+    assembledMessages: [],
+    liveMessages: params.liveMessages,
+    forkSourceMessageCount: params.forkSourceMessageCount,
+  });
+  const candidateMessages = suffix.length > 0 ? suffix : params.liveMessages;
+  const boundedMessages = trimMessagesToBudget(
+    candidateMessages,
+    Math.min(params.tokenBudget, params.bootstrapMaxTokens),
+  );
+  return {
+    messages: boundedMessages,
+    estimatedTokens: estimateAgentMessageTokens(boundedMessages),
+  };
+}
+
+function appendForkBoundedLiveSuffixWithinBudget(params: {
+  assembledMessages: AgentMessage[];
+  assembledEstimatedTokens: number;
+  liveMessages: AgentMessage[];
+  forkSourceMessageCount: number;
+  tokenBudget: number;
+}): {
+  messages: AgentMessage[];
+  estimatedTokens: number;
+  appendedMessages: number;
+  appendedTokens: number;
+  evictedMessages: number;
+  evictedTokens: number;
+  overBudget: boolean;
+  protectedIndexes: Set<number>;
+} {
+  const suffix = stripTrailingAssistantPrefill(
+    resolveForkBoundedLiveSuffix({
+      assembledMessages: params.assembledMessages,
+      liveMessages: params.liveMessages,
+      forkSourceMessageCount: params.forkSourceMessageCount,
+    }),
+  );
+  if (suffix.length === 0) {
+    return {
+      messages: params.assembledMessages,
+      estimatedTokens: params.assembledEstimatedTokens,
+      appendedMessages: 0,
+      appendedTokens: 0,
+      evictedMessages: 0,
+      evictedTokens: 0,
+      overBudget: params.assembledEstimatedTokens > params.tokenBudget,
+      protectedIndexes: new Set(),
+    };
+  }
+
+  let retained = params.assembledMessages.slice();
+  let retainedSuffix = suffix.slice();
+  let evictedMessages = 0;
+  let evictedTokens = 0;
+  let output = [...retained, ...retainedSuffix];
+  let estimatedTokens = estimateAgentMessageTokens(output);
+
+  while (retained.length > 0 && estimatedTokens > params.tokenBudget) {
+    const removed = retained.shift() as AgentMessage;
+    evictedMessages += 1;
+    evictedTokens += toStoredMessage(removed).tokenCount;
+    output = [...retained, ...retainedSuffix];
+    estimatedTokens = estimateAgentMessageTokens(output);
+  }
+
+  while (retainedSuffix.length > 0 && estimatedTokens > params.tokenBudget) {
+    const removed = retainedSuffix.shift() as AgentMessage;
+    evictedMessages += 1;
+    evictedTokens += toStoredMessage(removed).tokenCount;
+    output = [...retained, ...retainedSuffix];
+    estimatedTokens = estimateAgentMessageTokens(output);
+  }
+
+  const protectedIndexes = new Set<number>();
+  const suffixStartIndex = output.length - retainedSuffix.length;
+  for (let index = suffixStartIndex; index < output.length; index += 1) {
+    protectedIndexes.add(index);
+  }
+
+  return {
+    messages: output,
+    estimatedTokens,
+    appendedMessages: retainedSuffix.length,
+    appendedTokens: estimateAgentMessageTokens(retainedSuffix),
+    evictedMessages,
+    evictedTokens,
+    overBudget: estimatedTokens > params.tokenBudget,
+    protectedIndexes,
+  };
+}
+
 // ── LcmContextEngine ────────────────────────────────────────────────────────
 
 type TranscriptReconcileResult = {
@@ -3091,6 +3290,13 @@ export class LcmContextEngine implements ContextEngine {
           unsupportedMessage: [
             "lossless-claw requires a native OpenClaw runtime with the full context-engine agent-run lifecycle.",
             "Use the native Codex or Pi embedded runtime, or switch plugins.slots.contextEngine to legacy for CLI harness runs.",
+          ].join(" "),
+        },
+        "subagent-spawn": {
+          requiredCapabilities: LOSSLESS_SUBAGENT_SPAWN_REQUIRED_HOST_CAPABILITIES,
+          unsupportedMessage: [
+            "lossless-claw-managed forked children require host thread bootstrap projection.",
+            "Without it, the host may replay a raw parent JSONL branch into the child instead of the LCM-assembled compact view.",
           ].join(" "),
         },
       },
@@ -4943,6 +5149,7 @@ export class LcmContextEngine implements ContextEngine {
     this.recentBootstrapImportsByConversation.set(conversationId, {
       importedMessages: Math.max(0, Math.floor(importedMessages)),
       reason,
+      forkBounded: reason === FORK_BOUNDED_BOOTSTRAP_REASON,
       observedAt: new Date(),
     });
     while (this.recentBootstrapImportsByConversation.size > MAX_PREVIOUS_ASSEMBLED_SNAPSHOTS) {
@@ -6196,6 +6403,8 @@ export class LcmContextEngine implements ContextEngine {
     sessionFile: string;
     fileStats?: { size: number; mtimeMs: number };
     lastProcessedEntryHash?: string | null;
+    forkBounded?: boolean;
+    forkSourceMessageCount?: number;
   }): Promise<void> {
     const latestDbMessage = await this.conversationStore.getLastMessage(params.conversationId);
     const fileStats = params.fileStats ?? (await stat(params.sessionFile));
@@ -6215,6 +6424,8 @@ export class LcmContextEngine implements ContextEngine {
                 tokenCount: latestDbMessage.tokenCount,
               })
             : null,
+      forkBounded: params.forkBounded,
+      forkSourceMessageCount: params.forkSourceMessageCount,
     });
   }
 
@@ -6311,6 +6522,7 @@ export class LcmContextEngine implements ContextEngine {
     const sessionFileStats = await stat(params.sessionFile);
     const sessionFileSize = sessionFileStats.size;
     const sessionFileMtimeMs = Math.trunc(sessionFileStats.mtimeMs);
+    const parentSessionReference = await readSessionParentSessionReference(params.sessionFile);
 
     const result = await this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
@@ -6319,6 +6531,10 @@ export class LcmContextEngine implements ContextEngine {
           const persistBootstrapState = async (
             conversationId: number,
             lastProcessedEntryHash?: string | null,
+            forkState?: {
+              forkBounded: boolean;
+              forkSourceMessageCount: number;
+            },
           ): Promise<void> => {
             await this.refreshBootstrapState({
               conversationId,
@@ -6328,6 +6544,8 @@ export class LcmContextEngine implements ContextEngine {
                 mtimeMs: sessionFileMtimeMs,
               },
               lastProcessedEntryHash,
+              forkBounded: forkState?.forkBounded,
+              forkSourceMessageCount: forkState?.forkSourceMessageCount,
             });
             // Update the file-level cache so subsequent bootstraps against an
             // unchanged file can skip the full read via the cache guard.
@@ -6394,6 +6612,16 @@ export class LcmContextEngine implements ContextEngine {
           ) {
             if (!conversation.bootstrappedAt) {
               await this.conversationStore.markConversationBootstrapped(conversationId);
+            }
+            if (parentSessionReference !== null && !bootstrapState.forkBounded) {
+              const historicalMessages = await readLeafPathMessages(params.sessionFile);
+              await persistBootstrapState(conversationId, bootstrapState.lastProcessedEntryHash, {
+                forkBounded: true,
+                forkSourceMessageCount: historicalMessages.length,
+              });
+              this.deps.log.debug(
+                `[lcm] bootstrap: recovered fork-bounded checkpoint metadata conversation=${conversationId} ${sessionLabel} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+              );
             }
             this.deps.log.debug(
               `[lcm] bootstrap: checkpoint hit conversation=${conversationId} ${sessionLabel} existingCount=${existingCount} duration=${formatDurationMs(Date.now() - startedAt)}`,
@@ -6546,14 +6774,21 @@ export class LcmContextEngine implements ContextEngine {
               historicalMessages,
               resolveBootstrapMaxTokens(this.config),
             );
+            const forkBoundedBootstrap =
+              parentSessionReference !== null && bootstrapMessages.length < historicalMessages.length;
 
             if (bootstrapMessages.length === 0) {
               await this.conversationStore.markConversationBootstrapped(conversationId);
-              await persistBootstrapState(conversationId);
+              await persistBootstrapState(conversationId, undefined, {
+                forkBounded: forkBoundedBootstrap,
+                forkSourceMessageCount: historicalMessages.length,
+              });
               return {
                 bootstrapped: false,
                 importedMessages: 0,
-                reason: "no leaf-path messages in session",
+                reason: forkBoundedBootstrap
+                  ? FORK_BOUNDED_BOOTSTRAP_REASON
+                  : "no leaf-path messages in session",
               };
             }
 
@@ -6589,14 +6824,18 @@ export class LcmContextEngine implements ContextEngine {
                     toStoredMessage(bootstrapMessages[bootstrapMessages.length - 1]),
                   )
                 : undefined;
-            await persistBootstrapState(conversationId, lastImportedHash);
+            await persistBootstrapState(conversationId, lastImportedHash, {
+              forkBounded: forkBoundedBootstrap,
+              forkSourceMessageCount: historicalMessages.length,
+            });
             this.deps.log.debug(
-              `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+              `[lcm] bootstrap: initial import conversation=${conversationId} ${sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length} forkBounded=${forkBoundedBootstrap} duration=${formatDurationMs(Date.now() - startedAt)}`,
             );
 
             return {
               bootstrapped: true,
               importedMessages,
+              ...(forkBoundedBootstrap ? { reason: FORK_BOUNDED_BOOTSTRAP_REASON } : {}),
             };
           }
 
@@ -7974,8 +8213,25 @@ export class LcmContextEngine implements ContextEngine {
         }
       }
 
+      const bootstrapState = await this.summaryStore.getConversationBootstrapState(
+        conversation.conversationId,
+      );
+      const forkBoundedBootstrap = bootstrapState?.forkBounded === true;
+      const forkSourceMessageCount = bootstrapState?.forkSourceMessageCount ?? 0;
       const contextItems = await this.summaryStore.getContextItems(conversation.conversationId);
       if (contextItems.length === 0) {
+        if (forkBoundedBootstrap) {
+          const boundedFallback = buildForkBoundedLiveFallback({
+            liveMessages: params.messages,
+            forkSourceMessageCount,
+            tokenBudget,
+            bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+          });
+          this.deps.log.debug(
+            `[lcm] assemble: no context items for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+          );
+          return boundedFallback;
+        }
         this.deps.log.debug(
           `[lcm] assemble: no context items conversation=${conversation.conversationId} ${sessionLabel} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
@@ -7987,10 +8243,16 @@ export class LcmContextEngine implements ContextEngine {
       // the live path to avoid dropping prompt context.
       const hasSummaryItems = contextItems.some((item) => item.itemType === "summary");
       if (!hasSummaryItems && contextItems.length < params.messages.length) {
-        this.deps.log.debug(
-          `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
-        );
-        return safeFallback();
+        if (forkBoundedBootstrap) {
+          this.deps.log.debug(
+            `[lcm] assemble: using bounded fork bootstrap context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+          );
+        } else {
+          this.deps.log.debug(
+            `[lcm] assemble: falling back to live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} liveMessages=${params.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+          );
+          return safeFallback();
+        }
       }
 
       const assembled = await this.assembler.assemble({
@@ -8006,9 +8268,39 @@ export class LcmContextEngine implements ContextEngine {
         stubLargeToolPayloads: this.config.stubLargeToolPayloads,
       });
 
+      const forkLiveSuffixAppend = forkBoundedBootstrap
+        ? appendForkBoundedLiveSuffixWithinBudget({
+            assembledMessages: assembled.messages,
+            assembledEstimatedTokens: assembled.estimatedTokens,
+            liveMessages: params.messages,
+            forkSourceMessageCount,
+            tokenBudget,
+          })
+        : null;
+      const preRecallMessages = forkLiveSuffixAppend?.messages ?? assembled.messages;
+      const preRecallEstimatedTokens =
+        forkLiveSuffixAppend?.estimatedTokens ?? assembled.estimatedTokens;
+      if (forkLiveSuffixAppend && forkLiveSuffixAppend.appendedMessages > 0) {
+        this.deps.log.warn(
+          `[lcm] assemble: appended fork-bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} appendedMessages=${forkLiveSuffixAppend.appendedMessages} appendedTokens=${forkLiveSuffixAppend.appendedTokens} evictedMessages=${forkLiveSuffixAppend.evictedMessages} evictedTokens=${forkLiveSuffixAppend.evictedTokens} overBudget=${forkLiveSuffixAppend.overBudget}`,
+        );
+      }
+
       // If assembly produced no messages for a non-empty live session,
       // fail safe to the live context.
-      if (assembled.messages.length === 0 && params.messages.length > 0) {
+      if (preRecallMessages.length === 0 && params.messages.length > 0) {
+        if (forkBoundedBootstrap) {
+          const boundedFallback = buildForkBoundedLiveFallback({
+            liveMessages: params.messages,
+            forkSourceMessageCount,
+            tokenBudget,
+            bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+          });
+          this.deps.log.debug(
+            `[lcm] assemble: empty assembled output for fork-bounded bootstrap; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
+          );
+          return boundedFallback;
+        }
         this.deps.log.debug(
           `[lcm] assemble: empty assembled output, using live context conversation=${conversation.conversationId} ${sessionLabel} contextItems=${contextItems.length} tokenBudget=${tokenBudget} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
@@ -8020,10 +8312,22 @@ export class LcmContextEngine implements ContextEngine {
       // fall back to live context to prevent LLM prefill errors.  Summaries always
       // have role "user", so this only fires for raw-message-only DB states where
       // every stored message is role "assistant" or "toolResult".
-      const assembledHasUserTurn = assembled.messages.some((m) => m.role === "user");
+      const assembledHasUserTurn = preRecallMessages.some((m) => m.role === "user");
       if (!assembledHasUserTurn && params.messages.length > 0) {
+        if (forkBoundedBootstrap) {
+          const boundedFallback = buildForkBoundedLiveFallback({
+            liveMessages: params.messages,
+            forkSourceMessageCount,
+            tokenBudget,
+            bootstrapMaxTokens: resolveBootstrapMaxTokens(this.config),
+          });
+          this.deps.log.debug(
+            `[lcm] assemble: fork-bounded context has no user turns; using bounded live suffix conversation=${conversation.conversationId} ${sessionLabel} outputMessages=${boundedFallback.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+          );
+          return boundedFallback;
+        }
         this.deps.log.debug(
-          `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${assembled.messages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
+          `[lcm] assemble: assembled context has no user turns, falling back to live context to prevent prefill errors conversation=${conversation.conversationId} ${sessionLabel} assembledMessages=${preRecallMessages.length} duration=${formatDurationMs(Date.now() - startedAt)}`,
         );
         // Use safeFallback() so the result is a *new* array; otherwise the
         // gateway's `assembled.messages !== sourceMessages` reference-equality
@@ -8042,7 +8346,7 @@ export class LcmContextEngine implements ContextEngine {
         promptRecallCue = await this.buildPromptRecallCue({
           conversationId: conversation.conversationId,
           prompt: params.prompt,
-          assembledMessages: assembled.messages,
+          assembledMessages: preRecallMessages,
           coverageMessages: params.messages.filter(isVolatileLiveInputMessage),
         });
       } catch (error) {
@@ -8051,14 +8355,14 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
       let budgetedPromptRecallCue =
-        promptRecallCue && assembled.estimatedTokens + promptRecallCue.tokenCount <= tokenBudget
+        promptRecallCue && preRecallEstimatedTokens + promptRecallCue.tokenCount <= tokenBudget
           ? promptRecallCue
           : null;
       let assembledMessages = budgetedPromptRecallCue
-        ? [budgetedPromptRecallCue.message, ...assembled.messages]
-        : assembled.messages;
+        ? [budgetedPromptRecallCue.message, ...preRecallMessages]
+        : preRecallMessages;
       let assembledEstimatedTokens =
-        assembled.estimatedTokens + (budgetedPromptRecallCue?.tokenCount ?? 0);
+        preRecallEstimatedTokens + (budgetedPromptRecallCue?.tokenCount ?? 0);
       let protectedAssembledIndexes = resolveProtectedFreshTailAssembledIndexes({
         assembledMessages,
         freshTailMessageHashes:
@@ -8067,6 +8371,12 @@ export class LcmContextEngine implements ContextEngine {
       });
       if (budgetedPromptRecallCue) {
         protectedAssembledIndexes.add(0);
+      }
+      if (forkLiveSuffixAppend) {
+        const promptRecallOffset = budgetedPromptRecallCue ? 1 : 0;
+        for (const index of forkLiveSuffixAppend.protectedIndexes) {
+          protectedAssembledIndexes.add(index + promptRecallOffset);
+        }
       }
 
       let volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
@@ -8081,14 +8391,19 @@ export class LcmContextEngine implements ContextEngine {
         (volatileLiveInputAppend.overBudget || volatileLiveInputAppend.evictedMessages > 0)
       ) {
         budgetedPromptRecallCue = null;
-        assembledMessages = assembled.messages;
-        assembledEstimatedTokens = assembled.estimatedTokens;
+        assembledMessages = preRecallMessages;
+        assembledEstimatedTokens = preRecallEstimatedTokens;
         protectedAssembledIndexes = resolveProtectedFreshTailAssembledIndexes({
           assembledMessages,
           freshTailMessageHashes:
             assembled.debug?.freshTailProtectionMessageHashes ??
             assembled.debug?.preSanitizeFreshTailMessageHashes,
         });
+        if (forkLiveSuffixAppend) {
+          for (const index of forkLiveSuffixAppend.protectedIndexes) {
+            protectedAssembledIndexes.add(index);
+          }
+        }
         volatileLiveInputAppend = appendUncoveredVolatileLiveInputsWithinBudget({
           assembledMessages,
           assembledEstimatedTokens,
@@ -8282,6 +8597,11 @@ export class LcmContextEngine implements ContextEngine {
   async prepareSubagentSpawn(params: {
     parentSessionKey: string;
     childSessionKey: string;
+    contextMode?: "isolated" | "fork";
+    parentSessionId?: string;
+    parentSessionFile?: string;
+    childSessionId?: string;
+    childSessionFile?: string;
     ttlMs?: number;
   }): Promise<SubagentSpawnPreparation | undefined> {
     if (
