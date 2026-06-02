@@ -1,11 +1,14 @@
 import type { DatabaseSync } from "node:sqlite";
+import { FALLBACK_SUMMARY_MARKER } from "../summarize.js";
 
-export const FALLBACK_SUMMARY_MARKER = "[LCM fallback summary; truncated for context management]";
+export { FALLBACK_SUMMARY_MARKER };
 export const TRUNCATED_SUMMARY_PREFIX = "[Truncated from ";
+export const BARE_EMERGENCY_TRUNCATION_MARKER = "[Truncated for context management]";
+export const EMERGENCY_FALLBACK_MODEL = "emergency-fallback";
 export const TRUNCATED_SUMMARY_WINDOW = 40;
 export const FALLBACK_SUMMARY_WINDOW = 80;
 
-export type DoctorMarkerKind = "old" | "new" | "fallback";
+export type DoctorMarkerKind = "old" | "new" | "fallback" | "emergency";
 
 export type DoctorSummaryCandidate = {
   conversationId: number;
@@ -18,6 +21,7 @@ export type DoctorConversationCounts = {
   old: number;
   truncated: number;
   fallback: number;
+  emergency: number;
 };
 
 export type DoctorSummaryStats = {
@@ -26,6 +30,7 @@ export type DoctorSummaryStats = {
   old: number;
   truncated: number;
   fallback: number;
+  emergency: number;
   byConversation: Map<number, DoctorConversationCounts>;
 };
 
@@ -36,6 +41,7 @@ export type DoctorTargetRecord = {
   depth: number;
   tokenCount: number;
   content: string;
+  model: string;
   createdAt: string;
   childCount: number;
   markerKind: DoctorMarkerKind;
@@ -48,6 +54,7 @@ type DoctorTargetRow = {
   depth: number;
   token_count: number;
   content: string;
+  model: string;
   created_at: string;
   child_count: number | null;
 };
@@ -73,6 +80,23 @@ export function detectDoctorMarker(content: string): DoctorMarkerKind | null {
   return null;
 }
 
+function detectDoctorMarkerForRow(row: { content: string; model?: string }): DoctorMarkerKind | null {
+  const markerKind = detectDoctorMarker(row.content);
+  if (markerKind) {
+    return markerKind;
+  }
+
+  const model = row.model?.trim();
+  if (model === EMERGENCY_FALLBACK_MODEL) {
+    return "emergency";
+  }
+  if (model === "unknown" && row.content.includes(BARE_EMERGENCY_TRUNCATION_MARKER)) {
+    return "emergency";
+  }
+
+  return null;
+}
+
 /**
  * Load doctor targets for one conversation or the whole DB.
  */
@@ -89,6 +113,7 @@ export function loadDoctorTargets(
            COALESCE(s.depth, 0) AS depth,
            COALESCE(s.token_count, 0) AS token_count,
            COALESCE(s.content, '') AS content,
+           COALESCE(s.model, '') AS model,
            COALESCE(s.created_at, '') AS created_at,
            COALESCE(spc.child_count, 0) AS child_count
          FROM summaries s
@@ -99,6 +124,11 @@ export function loadDoctorTargets(
          ) spc ON spc.summary_id = s.summary_id
          WHERE INSTR(COALESCE(s.content, ''), ?) > 0
             OR INSTR(COALESCE(s.content, ''), ?) > 0
+            OR COALESCE(s.model, '') = ?
+            OR (
+              COALESCE(s.model, '') = 'unknown'
+              AND INSTR(COALESCE(s.content, ''), ?) > 0
+            )
          ORDER BY s.conversation_id ASC, COALESCE(s.depth, 0) ASC, s.created_at ASC, s.summary_id ASC`,
       )
     : db.prepare(
@@ -109,6 +139,7 @@ export function loadDoctorTargets(
            COALESCE(s.depth, 0) AS depth,
            COALESCE(s.token_count, 0) AS token_count,
            COALESCE(s.content, '') AS content,
+           COALESCE(s.model, '') AS model,
            COALESCE(s.created_at, '') AS created_at,
            COALESCE(spc.child_count, 0) AS child_count
          FROM summaries s
@@ -121,17 +152,33 @@ export function loadDoctorTargets(
            AND (
              INSTR(COALESCE(s.content, ''), ?) > 0
              OR INSTR(COALESCE(s.content, ''), ?) > 0
+             OR COALESCE(s.model, '') = ?
+             OR (
+               COALESCE(s.model, '') = 'unknown'
+               AND INSTR(COALESCE(s.content, ''), ?) > 0
+             )
            )
          ORDER BY COALESCE(s.depth, 0) ASC, s.created_at ASC, s.summary_id ASC`,
       );
 
   const rows = (conversationId === undefined
-    ? statement.all(FALLBACK_SUMMARY_MARKER, TRUNCATED_SUMMARY_PREFIX)
-    : statement.all(conversationId, FALLBACK_SUMMARY_MARKER, TRUNCATED_SUMMARY_PREFIX)) as DoctorTargetRow[];
+    ? statement.all(
+        FALLBACK_SUMMARY_MARKER,
+        TRUNCATED_SUMMARY_PREFIX,
+        EMERGENCY_FALLBACK_MODEL,
+        BARE_EMERGENCY_TRUNCATION_MARKER,
+      )
+    : statement.all(
+        conversationId,
+        FALLBACK_SUMMARY_MARKER,
+        TRUNCATED_SUMMARY_PREFIX,
+        EMERGENCY_FALLBACK_MODEL,
+        BARE_EMERGENCY_TRUNCATION_MARKER,
+      )) as DoctorTargetRow[];
 
   const targets: DoctorTargetRecord[] = [];
   for (const row of rows) {
-    const markerKind = detectDoctorMarker(row.content);
+    const markerKind = detectDoctorMarkerForRow(row);
     if (!markerKind) {
       continue;
     }
@@ -142,6 +189,7 @@ export function loadDoctorTargets(
       depth: Math.max(0, Math.floor(row.depth ?? 0)),
       tokenCount: Math.max(0, Math.floor(row.token_count ?? 0)),
       content: row.content,
+      model: row.model,
       createdAt: row.created_at,
       childCount:
         typeof row.child_count === "number" && Number.isFinite(row.child_count)
@@ -166,6 +214,7 @@ export function getDoctorSummaryStats(
   let old = 0;
   let truncated = 0;
   let fallback = 0;
+  let emergency = 0;
 
   for (const target of targets) {
     const current = byConversation.get(target.conversationId) ?? {
@@ -173,6 +222,7 @@ export function getDoctorSummaryStats(
       old: 0,
       truncated: 0,
       fallback: 0,
+      emergency: 0,
     };
     current.total += 1;
 
@@ -188,6 +238,10 @@ export function getDoctorSummaryStats(
       case "fallback":
         fallback += 1;
         current.fallback += 1;
+        break;
+      case "emergency":
+        emergency += 1;
+        current.emergency += 1;
         break;
     }
 
@@ -205,6 +259,7 @@ export function getDoctorSummaryStats(
     old,
     truncated,
     fallback,
+    emergency,
     byConversation,
   };
 }

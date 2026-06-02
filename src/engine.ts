@@ -71,8 +71,10 @@ import { buildMessageIdentityHash } from "./store/message-identity.js";
 import { FocusBriefStore, type FocusBriefRecord } from "./store/focus-brief-store.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
 import {
+  buildDeterministicFallbackSummary,
   createLcmSummarizeFromLegacyParams,
   extractProviderAuthFailure,
+  FALLBACK_SUMMARY_MARKER,
   LcmProviderAuthError,
   LcmSummarySpendLimitError,
   type LcmSummarizeFn,
@@ -4857,7 +4859,7 @@ export class LcmContextEngine implements ContextEngine {
       );
     }
     this.deps.log.error(`[lcm] resolveSummarize: FALLING BACK TO EMERGENCY TRUNCATION`);
-    return { summarize: createEmergencyFallbackSummarize(), summaryModel: "unknown" };
+    return { summarize: createEmergencyFallbackSummarize(), summaryModel: "emergency-fallback" };
   }
 
   /**
@@ -11070,11 +11072,14 @@ function createEmergencyFallbackSummarize(): (
   aggressive?: boolean,
 ) => Promise<string> {
   return async (text: string, aggressive?: boolean): Promise<string> => {
-    const maxChars = aggressive ? 600 * 4 : 900 * 4;
-    if (text.length <= maxChars) {
-      return text;
+    const targetTokens = aggressive ? 600 : 900;
+    const fallbackSummary = buildDeterministicFallbackSummary(text, targetTokens).trim();
+    if (!fallbackSummary) {
+      return FALLBACK_SUMMARY_MARKER;
     }
-    return text.slice(0, maxChars) + "\n[Truncated for context management]";
+    return fallbackSummary.includes(FALLBACK_SUMMARY_MARKER)
+      ? fallbackSummary
+      : `${fallbackSummary}\n${FALLBACK_SUMMARY_MARKER}`;
   };
 }
 

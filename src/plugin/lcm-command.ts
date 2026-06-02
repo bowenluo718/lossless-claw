@@ -943,6 +943,7 @@ async function buildStatusText(params: {
         old: 0,
         truncated: 0,
         fallback: 0,
+        emergency: 0,
       };
     const maintenance = await getConversationCompactionMaintenanceByConversationId(
       params.db,
@@ -1087,6 +1088,7 @@ async function buildDoctorText(params: {
       buildStatLine("old-marker summaries", formatNumber(stats.old)),
       buildStatLine("truncated-marker summaries", formatNumber(stats.truncated)),
       buildStatLine("fallback-marker summaries", formatNumber(stats.fallback)),
+      buildStatLine("emergency-fallback summaries", formatNumber(stats.emergency)),
       buildStatLine("result", stats.total === 0 ? "clean" : "issues found"),
     ]),
   ];
@@ -2397,6 +2399,7 @@ async function buildDoctorApplyText(params: {
       buildStatLine("old-marker summaries", formatNumber(stats.old)),
       buildStatLine("truncated-marker summaries", formatNumber(stats.truncated)),
       buildStatLine("fallback-marker summaries", formatNumber(stats.fallback)),
+      buildStatLine("emergency-fallback summaries", formatNumber(stats.emergency)),
       buildStatLine("repaired summaries", formatNumber(result.repaired)),
       buildStatLine("unchanged summaries", formatNumber(result.unchanged)),
       buildStatLine("skipped summaries", formatNumber(result.skipped.length)),

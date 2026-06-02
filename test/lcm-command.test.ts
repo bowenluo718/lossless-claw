@@ -1157,6 +1157,15 @@ describe("lcm command", () => {
       tokenCount: 11,
     });
     await fixture.summaryStore.insertSummary({
+      summaryId: "sum_current_emergency",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `raw transcript fallback\n${"[Truncated for context management]"}`,
+      tokenCount: 12,
+      model: "unknown",
+    });
+    await fixture.summaryStore.insertSummary({
       summaryId: "sum_other_new",
       conversationId: otherConversation.conversationId,
       kind: "leaf",
@@ -1174,11 +1183,12 @@ describe("lcm command", () => {
     expect(result.text).toContain("🩺 Lossless Claw Doctor");
     expect(result.text).toContain(`conversation id: ${currentConversation.conversationId}`);
     expect(result.text).toContain("scope: this conversation only");
-    expect(result.text).toContain("detected summaries: 2");
+    expect(result.text).toContain("detected summaries: 3");
     expect(result.text).toContain("old-marker summaries: 1");
     expect(result.text).toContain("truncated-marker summaries: 1");
+    expect(result.text).toContain("emergency-fallback summaries: 1");
     expect(result.text).toContain("result: issues found");
-    expect(result.text).toContain("sum_current_new (new), sum_current_old (old)");
+    expect(result.text).toContain("sum_current_emergency (emergency), sum_current_new (new), sum_current_old (old)");
     expect(result.text).toContain("**🛠️ Next step**");
     expect(result.text).toContain("`/lossless doctor apply` repairs these in place for the current conversation.");
     expect(result.text).not.toContain("sum_other_new");
@@ -1208,6 +1218,15 @@ describe("lcm command", () => {
       tokenCount: 9,
     });
     await fixture.summaryStore.insertSummary({
+      summaryId: "sum_unknown_clean",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: "healthy custom summarizer output",
+      tokenCount: 8,
+      model: "unknown",
+    });
+    await fixture.summaryStore.insertSummary({
       summaryId: "sum_dirty",
       conversationId: otherConversation.conversationId,
       kind: "leaf",
@@ -1229,6 +1248,7 @@ describe("lcm command", () => {
     expect(result.text).toContain("result: clean");
     expect(result.text).not.toContain("🧷 Affected summaries");
     expect(result.text).not.toContain("sum_dirty");
+    expect(result.text).not.toContain("sum_unknown_clean");
   });
 
   it("reports doctor as unavailable when the current conversation cannot be resolved", async () => {
@@ -1913,7 +1933,7 @@ describe("lcm command", () => {
       sessionId: "doctor-apply-current",
       sessionKey: "agent:main:telegram:direct:doctor-apply-current",
     });
-    const [firstMessage, secondMessage] = await fixture.conversationStore.createMessagesBulk([
+    const [firstMessage, secondMessage, thirdMessage] = await fixture.conversationStore.createMessagesBulk([
       {
         conversationId: currentConversation.conversationId,
         seq: 0,
@@ -1927,6 +1947,13 @@ describe("lcm command", () => {
         role: "assistant",
         content: "second broken message",
         tokenCount: 7,
+      },
+      {
+        conversationId: currentConversation.conversationId,
+        seq: 2,
+        role: "user",
+        content: "third emergency fallback source",
+        tokenCount: 8,
       },
     ]);
 
@@ -1943,6 +1970,17 @@ describe("lcm command", () => {
       firstMessage.messageId,
       secondMessage.messageId,
     ]);
+    await fixture.summaryStore.insertSummary({
+      summaryId: "sum_emergency_fix",
+      conversationId: currentConversation.conversationId,
+      kind: "leaf",
+      depth: 0,
+      content: `raw emergency fallback\n${"[Truncated for context management]"}`,
+      tokenCount: 10,
+      sourceMessageTokenCount: 8,
+      model: "unknown",
+    });
+    await fixture.summaryStore.linkSummaryToMessages("sum_emergency_fix", [thirdMessage.messageId]);
 
     await fixture.summaryStore.insertSummary({
       summaryId: "sum_parent_fix",
@@ -1961,15 +1999,19 @@ describe("lcm command", () => {
     );
 
     const repairedLeaf = await fixture.summaryStore.getSummary("sum_leaf_fix");
+    const repairedEmergency = await fixture.summaryStore.getSummary("sum_emergency_fix");
     const repairedParent = await fixture.summaryStore.getSummary("sum_parent_fix");
 
-    expect(result.text).toContain("detected summaries: 2");
-    expect(result.text).toContain("repaired summaries: 2");
-    expect(result.text).toContain("result: repaired 2 summary(s) in place");
-    expect(result.text).toContain("sum_leaf_fix, sum_parent_fix");
-    expect(summarize).toHaveBeenCalledTimes(2);
+    expect(result.text).toContain("detected summaries: 3");
+    expect(result.text).toContain("emergency-fallback summaries: 1");
+    expect(result.text).toContain("repaired summaries: 3");
+    expect(result.text).toContain("result: repaired 3 summary(s) in place");
+    expect(result.text).toContain("sum_emergency_fix, sum_leaf_fix, sum_parent_fix");
+    expect(summarize).toHaveBeenCalledTimes(3);
     expect(repairedLeaf?.content).toContain("LEAF REPAIR");
     expect(repairedLeaf?.content).not.toContain("[Truncated from");
+    expect(repairedEmergency?.content).toContain("LEAF REPAIR");
+    expect(repairedEmergency?.content).not.toContain("[Truncated for context management]");
     expect(repairedParent?.content).toContain("CONDENSED REPAIR");
     expect(repairedParent?.content).toContain("LEAF REPAIR");
     expect(repairedParent?.content).not.toContain("[LCM fallback summary");

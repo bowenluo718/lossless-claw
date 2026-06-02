@@ -78,6 +78,7 @@ type SummaryMode = "normal" | "aggressive";
 
 const DEFAULT_LEAF_TARGET_TOKENS = 2400;
 const DEFAULT_CONDENSED_TARGET_TOKENS = 2000;
+export const FALLBACK_SUMMARY_MARKER = "[LCM fallback summary; truncated for context management]";
 const FALLBACK_DIRECTIVE_OMISSION =
   "[LCM fallback summary omitted directive-shaped untrusted content].";
 const FALLBACK_DIRECTIVE_SHAPED_PATTERN = new RegExp(
@@ -1249,7 +1250,7 @@ function sanitizeDeterministicFallbackText(text: string): {
  * Keeps compaction progress monotonic instead of throwing and aborting the
  * whole compaction pass.
  */
-function buildDeterministicFallbackSummary(text: string, targetTokens: number): string {
+export function buildDeterministicFallbackSummary(text: string, targetTokens: number): string {
   if (typeof text !== "string") return "";
   const trimmed = text.trim();
   if (!trimmed) {
@@ -1260,7 +1261,7 @@ function buildDeterministicFallbackSummary(text: string, targetTokens: number): 
     sanitizeDeterministicFallbackText(trimmed);
   const fallbackNote = omittedDirectiveShapedContent
     ? "[LCM fallback summary; directive-shaped untrusted content omitted]"
-    : "[LCM fallback summary; truncated for context management]";
+    : FALLBACK_SUMMARY_MARKER;
   if (!sanitizedText) {
     return fallbackNote;
   }
