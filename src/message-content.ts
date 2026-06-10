@@ -463,6 +463,10 @@ export function buildMessageParts(params: {
   const topLevelReasoning = extractTopLevelReasoningContent(role, topLevel);
   const rawPayloadExternalized = safeBoolean(topLevel.rawPayloadExternalized);
   const externalizedFileId = safeString(topLevel.externalizedFileId);
+  const externalizedFileIds = Array.isArray(topLevel.externalizedFileIds)
+    ? topLevel.externalizedFileIds.filter((fileId): fileId is string => typeof fileId === "string")
+    : undefined;
+  const fileBlocksExternalized = safeBoolean(topLevel.fileBlocksExternalized);
   const originalByteSize =
     typeof topLevel.originalByteSize === "number"
       ? topLevel.originalByteSize
@@ -517,6 +521,8 @@ export function buildMessageParts(params: {
           ...topLevelReasoningMetadata(topLevelReasoning),
           rawPayloadExternalized: rawPayloadExternalized || undefined,
           externalizedFileId,
+          externalizedFileIds,
+          fileBlocksExternalized: fileBlocksExternalized || undefined,
           originalByteSize,
           externalizationReason,
         }),

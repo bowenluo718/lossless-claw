@@ -1,4 +1,6 @@
+import { open, realpath } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
+import { resolve as resolvePath, sep as pathSep } from "node:path";
 import { withDatabaseTransaction } from "../transaction-mutex.js";
 import { appendConversationScopeConstraint } from "./conversation-scope.js";
 import { sanitizeFts5Query } from "./fts5-sanitize.js";
@@ -109,6 +111,11 @@ export type LargeFileRecord = {
   storageUri: string;
   explorationSummary: string | null;
   createdAt: Date;
+};
+
+export type LargeFileReadOptions = {
+  largeFilesDir: string;
+  maxBytes?: number;
 };
 
 export type UpsertConversationBootstrapStateInput = {
@@ -1560,6 +1567,124 @@ export class SummaryStore {
       )
       .all(conversationId) as unknown as LargeFileRow[];
     return rows.map(toLargeFileRecord);
+  }
+
+  /**
+   * Return true when one externalized text payload exactly matches content.
+   */
+  async largeFileContentEquals(
+    fileId: string,
+    content: string,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
+    const byteSize = Buffer.byteLength(content, "utf8");
+    const row = this.db
+      .prepare(
+        `SELECT storage_uri
+       FROM large_files
+       WHERE file_id = ?
+         AND byte_size = ?
+       LIMIT 1`,
+      )
+      .get(fileId, byteSize) as { storage_uri: string } | undefined;
+    if (!row) {
+      return false;
+    }
+
+    return this.validatedLargeFileContentEquals(row.storage_uri, content, options);
+  }
+
+  /** Read a persisted large-file payload from disk, returning null when unavailable. */
+  async getLargeFileContent(
+    fileId: string,
+    options: LargeFileReadOptions,
+  ): Promise<string | null> {
+    const row = this.db
+      .prepare(
+        `SELECT storage_uri
+       FROM large_files
+       WHERE file_id = ?
+       LIMIT 1`,
+      )
+      .get(fileId) as { storage_uri: string } | undefined;
+    if (!row) {
+      return null;
+    }
+
+    return this.readValidatedLargeFileContent(row.storage_uri, options);
+  }
+
+  private async validatedLargeFileContentEquals(
+    storageUri: string,
+    expectedContent: string,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
+    const expected = Buffer.from(expectedContent, "utf8");
+    try {
+      const file = await this.openValidatedLargeFile(storageUri, options);
+      if (!file) {
+        return false;
+      }
+      try {
+        const stats = await file.stat();
+        if (!stats.isFile() || stats.size !== expected.length) {
+          return false;
+        }
+        const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, expected.length)));
+        let offset = 0;
+        while (offset < expected.length) {
+          const length = Math.min(buffer.length, expected.length - offset);
+          const { bytesRead } = await file.read(buffer, 0, length, offset);
+          if (bytesRead !== length) {
+            return false;
+          }
+          if (!buffer.subarray(0, length).equals(expected.subarray(offset, offset + length))) {
+            return false;
+          }
+          offset += length;
+        }
+        return true;
+      } finally {
+        await file.close().catch(() => undefined);
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  private async readValidatedLargeFileContent(
+    storageUri: string,
+    options: LargeFileReadOptions,
+  ): Promise<string | null> {
+    try {
+      const file = await this.openValidatedLargeFile(storageUri, options);
+      if (!file) {
+        return null;
+      }
+      try {
+        const stats = await file.stat();
+        if (!stats.isFile() || (options.maxBytes != null && stats.size > options.maxBytes)) {
+          return null;
+        }
+        return await file.readFile({ encoding: "utf8" });
+      } finally {
+        await file.close().catch(() => undefined);
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  private async openValidatedLargeFile(
+    storageUri: string,
+    options: LargeFileReadOptions,
+  ): Promise<Awaited<ReturnType<typeof open>> | null> {
+    const safeRoot = await realpath(resolvePath(options.largeFilesDir));
+    const realTarget = await realpath(resolvePath(storageUri));
+    if (realTarget !== safeRoot && !realTarget.startsWith(safeRoot + pathSep)) {
+      return null;
+    }
+    return open(realTarget, "r");
   }
 
   // ── Bootstrap state ──────────────────────────────────────────────────────

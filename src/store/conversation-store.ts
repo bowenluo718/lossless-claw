@@ -787,6 +787,38 @@ export class ConversationStore {
     return row ? toMessageRecord(row) : null;
   }
 
+  /** Return the persisted identity hash for the newest message in a conversation. */
+  async getLastMessageIdentityHash(conversationId: ConversationId): Promise<string | null> {
+    const row = this.db
+      .prepare(
+        `SELECT identity_hash FROM messages
+       WHERE conversation_id = ?
+       ORDER BY seq DESC
+       LIMIT 1`,
+      )
+      .get(conversationId) as { identity_hash: string | null } | undefined;
+    return row?.identity_hash ?? null;
+  }
+
+  /** Return the newest `limit` persisted identity hashes in ascending seq order. */
+  async getRecentMessageIdentityHashes(
+    conversationId: ConversationId,
+    limit: number,
+  ): Promise<string[]> {
+    const rows = this.db
+      .prepare(
+        `SELECT identity_hash FROM messages
+       WHERE conversation_id = ?
+       ORDER BY seq DESC
+       LIMIT ?`,
+      )
+      .all(conversationId, limit) as { identity_hash: string | null }[];
+    return rows
+      .map((r) => r.identity_hash)
+      .filter((h): h is string => h !== null)
+      .reverse();
+  }
+
   async hasMessage(
     conversationId: ConversationId,
     role: MessageRole,

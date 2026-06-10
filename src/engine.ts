@@ -369,7 +369,12 @@ export class LcmContextEngine implements ContextEngine {
       this.summaryStore,
       (params) => this.resolveLargeFileTextSummarizer(params),
     );
-    this.batchDeduplicator = new BatchDeduplicator(this.conversationStore, this.deps);
+    this.batchDeduplicator = new BatchDeduplicator(
+      this.conversationStore,
+      this.summaryStore,
+      this.config.largeFilesDir,
+      this.deps,
+    );
     this.sessionRolloverDetector = new SessionRolloverDetector(
       this.conversationStore,
       this.summaryStore,
@@ -2679,6 +2684,9 @@ export class LcmContextEngine implements ContextEngine {
           messageForParts = {
             ...message,
             content: stored.content,
+            fileBlocksExternalized: true,
+            externalizedFileIds: intercepted.fileIds,
+            externalizationReason: "large_file_block",
           } as AgentMessage;
         }
       }

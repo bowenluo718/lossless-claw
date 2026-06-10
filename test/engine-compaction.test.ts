@@ -8,7 +8,9 @@ import { join } from "node:path";
 import { createLcmDatabaseConnection } from "../src/db/connection.js";
 import { LcmContextEngine } from "../src/engine.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
+import { formatFileReference } from "../src/large-files.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
+import { buildMessageIdentityHash } from "../src/store/message-identity.js";
 import {
   cleanupEngineTestState,
   firstCompleteCall,
@@ -190,6 +192,53 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "new C", "new D"]);
+  });
+
+  it("does not trim on stale identity_hash without matching content", async () => {
+    const engine = createEngine();
+    const sessionId = "dedup-stale-identity-hash";
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-stale-identity-hash"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const db = (engine as unknown as {
+      db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+    }).db;
+    db.prepare(`UPDATE messages SET identity_hash = ? WHERE conversation_id = ? AND seq = ?`).run(
+      buildMessageIdentityHash("assistant", "new B"),
+      conversation!.conversationId,
+      1,
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-stale-identity-hash-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "new B" }),
+        makeMessage({ role: "assistant", content: "new C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old A",
+      "old B",
+      "old A",
+      "new B",
+      "new C",
+    ]);
   });
 
   it("deduplicates replay when runtime sessionId changes but stable sessionKey continues", async () => {
@@ -481,6 +530,1127 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(warnLog).toHaveBeenCalledWith(
       `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — fail-closed skipping full batch`,
     );
+  });
+
+  it("preserves a repeated large-file message without an exact replay anchor", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-repeated-message";
+    const fileText = `${"dedup rewritten file line\n".repeat(160)}done`;
+    const originalContent = `<file name="dedup.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-repeated-message"),
+      messages: [makeMessage({ role: "user", content: originalContent })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-repeated-message-2"),
+      messages: [makeMessage({ role: "user", content: originalContent })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(2);
+    expect(stored[0].content).toContain("[LCM File: file_");
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[0].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+  });
+
+  it("deduplicates anchored afterTurn replay after large-file content rewriting", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-rewrite-anchored-replay";
+    const fileText = `${"anchored rewritten file line\n".repeat(160)}done`;
+    const originalContent = `<file name="anchored.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-rewrite-anchored-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-rewrite-anchored-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((message) => message.role)).toEqual([
+      "user",
+      "user",
+      "assistant",
+      "assistant",
+    ]);
+    expect(stored.map((message) => message.content)).toEqual([
+      "old A",
+      expect.stringContaining("[LCM File: file_"),
+      "old C",
+      "new D",
+    ]);
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+  });
+
+  it("deduplicates mixed small and externalized file block replays", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 500 });
+    const sessionId = "dedup-large-file-mixed-inline-replay";
+    const smallFile = `<file name="small.txt" mime="text/plain">small inline file</file>`;
+    const largeText = `${"mixed externalized file line\n".repeat(1200)}done`;
+    const mixedContent = [
+      "before files",
+      smallFile,
+      `<file name="large.md" mime="text/markdown">${largeText}</file>`,
+      "after files",
+    ].join("\n");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-mixed-inline-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: mixedContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-mixed-inline-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: mixedContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain(smallFile);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[1].content).not.toContain(largeText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates inline externalized file block replays", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 500 });
+    const sessionId = "dedup-large-file-inline-replay";
+    const fileText = `${"inline externalized file line\n".repeat(1200)}done`;
+    const inlineContent =
+      `prefix <file name="inline.md" mime="text/markdown">${fileText}</file> suffix`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-inline-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: inlineContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-inline-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: inlineContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("prefix [LCM File: file_");
+    expect(stored[1].content).toContain(" suffix");
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates anchored replays with multiple externalized file blocks in one message", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-multi-file-block-message";
+    const firstText = `${"first same-message file line\n".repeat(160)}done`;
+    const secondText = `${"second same-message file line\n".repeat(160)}done`;
+    const multiFileContent = [
+      `<file name="first.md" mime="text/markdown">${firstText}</file>`,
+      "middle text",
+      `<file name="second.md" mime="text/markdown">${secondText}</file>`,
+    ].join("\n");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-multi-file-block-message"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: multiFileContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-multi-file-block-message-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: multiFileContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content.match(/\[LCM File: file_/g)).toHaveLength(2);
+    expect(stored[1].content).not.toContain(firstText.slice(0, 64));
+    expect(stored[1].content).not.toContain(secondText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates externalized file replays when the filename contains a bracket", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-bracket-filename";
+    const fileText = `${"bracket filename file line\n".repeat(160)}done`;
+    const originalContent = `<file name="report]v2.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-bracket-filename"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-bracket-filename-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("report]v2.md");
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates externalized file replays when the filename contains an LCM-looking substring", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-lcm-substring-filename";
+    const fileText = `${"lcm substring filename file line\n".repeat(160)}done`;
+    const originalContent =
+      `<file name="notes [LCM File: file_deadbeefdeadbeef.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-lcm-substring-filename"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-lcm-substring-filename-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("notes [LCM File: file_deadbeefdeadbeef.md");
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates externalized file replays with incidental LCM text before the file", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-incidental-before-real";
+    const fileText = `${"incidental before real file line\n".repeat(160)}done`;
+    const incidentalReference = "[LCM File: file_deadbeefdeadbeef | fake.md | text/markdown | 1 bytes]";
+    const originalContent = [
+      `compare ${incidentalReference} with`,
+      `<file name="real.md" mime="text/markdown">${fileText}</file>`,
+    ].join("\n");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-incidental-before-real"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-incidental-before-real-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain(incidentalReference);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates anchored raw payload reference replays", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-raw-payload-replay";
+    const rawText = `${"raw payload replay line\n".repeat(160)}done`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-raw-payload-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: rawText }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-raw-payload-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: rawText }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("[LCM Raw Payload: file_");
+    expect(stored[1].content).not.toContain(rawText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates anchored serialized raw payload reference replays", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-serialized-raw-payload-replay";
+    const rawText = `${"serialized raw payload replay line\n".repeat(160)}done`;
+    const rawPayload = [{ type: "text", text: rawText, metadata: { source: "vendor" } }];
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-serialized-raw-payload-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: rawPayload }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-serialized-raw-payload-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: rawPayload }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("[LCM Raw Payload: file_");
+    expect(stored[1].content).not.toContain(rawText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates raw payload replays after file block rewriting", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-raw-payload-file-block-replay";
+    const fileText = `${"raw payload file block replay line\n".repeat(160)}done`;
+    const surroundingText = `${"raw payload surrounding text\n".repeat(80)}done`;
+    const rawContent = [
+      surroundingText,
+      `<file name="raw-file.md" mime="text/markdown">${fileText}</file>`,
+      surroundingText,
+    ].join("\n");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-raw-payload-file-block-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: rawContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-raw-payload-file-block-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: rawContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("[LCM Raw Payload: file_");
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("does not read raw payload sidecars when incoming content has no file blocks", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-raw-payload-no-file-block-read";
+    const rawText = `${"raw payload no file block line\n".repeat(160)}done`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-raw-payload-no-file-block-read"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: rawText }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const getLargeFileContentSpy = vi.spyOn(engine.getSummaryStore(), "getLargeFileContent");
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-raw-payload-no-file-block-read-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: `${rawText}\nchanged` }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    expect(getLargeFileContentSpy).not.toHaveBeenCalled();
+  });
+
+  it("preserves anchored tool output reference replays without metadata proof", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-tool-output-replay";
+    const toolOutput = `${"tool output replay line\n".repeat(160)}done`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-tool-output-replay"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "tool", content: toolOutput }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-tool-output-replay-2"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "tool", content: toolOutput }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(7);
+    expect(stored[1].content).toContain("[LCM Tool Output: file_");
+    expect(stored[4].content).toContain("[LCM Tool Output: file_");
+    expect(stored[1].content).not.toContain(toolOutput.slice(0, 64));
+    expect(stored[4].content).not.toContain(toolOutput.slice(0, 64));
+    expect(stored[6].content).toBe("new D");
+  });
+
+  it("preserves externalized-only repeated file prefixes when a new suffix is present", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-rewrite-prefix-replay";
+    const fileText = `${"prefix replay file line\n".repeat(160)}done`;
+    const originalContent = `<file name="prefix.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-rewrite-prefix-replay"),
+      messages: [makeMessage({ role: "user", content: originalContent })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-rewrite-prefix-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "new assistant suffix" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(3);
+    expect(stored[0].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[2].content).toBe("new assistant suffix");
+  });
+
+  it("preserves multi-message externalized replay prefixes without an exact anchor", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-multi-prefix-replay";
+    const firstText = `${"first prefix replay file line\n".repeat(160)}done`;
+    const secondText = `${"second prefix replay file line\n".repeat(160)}done`;
+    const firstContent = `<file name="first-prefix.md" mime="text/markdown">${firstText}</file>`;
+    const secondContent = `<file name="second-prefix.md" mime="text/markdown">${secondText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-multi-prefix-replay"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: firstContent }),
+        makeMessage({ role: "user", content: secondContent }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-multi-prefix-replay-2"),
+      messages: [
+        makeMessage({ role: "user", content: firstContent }),
+        makeMessage({ role: "user", content: secondContent }),
+        makeMessage({ role: "assistant", content: "new assistant suffix" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(6);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[2].content).toContain("[LCM File: file_");
+    expect(stored[3].content).toContain("[LCM File: file_");
+    expect(stored[4].content).toContain("[LCM File: file_");
+    expect(stored[1].content).not.toContain(firstText.slice(0, 64));
+    expect(stored[2].content).not.toContain(secondText.slice(0, 64));
+    expect(stored[3].content).not.toContain(firstText.slice(0, 64));
+    expect(stored[4].content).not.toContain(secondText.slice(0, 64));
+    expect(stored[5].content).toBe("new assistant suffix");
+  });
+
+  it("preserves oversized externalized-only overlaps", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-oversized-externalized-only";
+    const fileText = `${"oversized externalized-only file line\n".repeat(160)}done`;
+    const originalContent = `<file name="oversized-only.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-oversized-externalized-only"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "assistant", content: "old B" }),
+        makeMessage({ role: "user", content: originalContent }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-oversized-externalized-only-2"),
+      messages: [
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "new assistant suffix" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(5);
+    expect(stored[2].content).toContain("[LCM File: file_");
+    expect(stored[3].content).toContain("[LCM File: file_");
+    expect(stored[4].content).toBe("new assistant suffix");
+  });
+
+  it("deduplicates exact-anchored suffixes ending at an externalized file", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-exact-anchored-externalized-boundary";
+    const fileText = `${"externalized boundary replay file line\n".repeat(160)}done`;
+    const originalContent = `<file name="boundary.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-exact-anchored-externalized-boundary"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-exact-anchored-externalized-boundary-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "new assistant suffix" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(3);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[2].content).toBe("new assistant suffix");
+  });
+
+  it("does not trim repeated file bytes when file metadata changed", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-metadata-change";
+    const fileText = `${"metadata sensitive file line\n".repeat(160)}done`;
+    const oldContent = `<file name="old.md" mime="text/markdown">${fileText}</file>`;
+    const newContent = `<file name="new.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-metadata-change"),
+      messages: [makeMessage({ role: "user", content: oldContent })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-metadata-change-2"),
+      messages: [
+        makeMessage({ role: "user", content: newContent }),
+        makeMessage({ role: "assistant", content: "new metadata suffix" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(3);
+    expect(stored[0].content).toContain("old.md");
+    expect(stored[1].content).toContain("new.md");
+    expect(stored[2].content).toBe("new metadata suffix");
+  });
+
+  it("does not match plain text against an externalized file reference", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-plain-text-not-file";
+    const fileText = `${"plain text is not file metadata line\n".repeat(160)}done`;
+    const fileContent = `<file name="plain.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-plain-text-not-file"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: fileContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-plain-text-not-file-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: fileText }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(7);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[4].content).toContain("[LCM Raw Payload: file_");
+    expect(stored[6].content).toBe("new D");
+  });
+
+  it("does not trim uploads against pasted LCM file references without provenance", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-pasted-reference";
+    const fileText = `${"pasted reference file line\n".repeat(160)}done`;
+    const fileContent = `<file name="pasted.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-pasted-reference"),
+      messages: [makeMessage({ role: "user", content: fileContent })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const initialMessages = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const pastedReference = `prefix ${initialMessages[0]!.content} suffix`;
+    const pastedFileId = /\[LCM File:\s*(file_[a-f0-9]{16})/.exec(initialMessages[0]!.content)?.[1];
+    expect(pastedFileId).toBeDefined();
+    const anchor = "pasted reference anchor";
+    const nextSeq = (await engine.getConversationStore().getMaxSeq(conversation!.conversationId)) + 1;
+    const pastedMessages = await engine.getConversationStore().createMessagesBulk([
+      {
+        conversationId: conversation!.conversationId,
+        seq: nextSeq,
+        role: "assistant",
+        content: anchor,
+        tokenCount: 1,
+        identityHash: buildMessageIdentityHash("assistant", anchor),
+        createdAt: "2030-01-01 00:00:00",
+      },
+      {
+        conversationId: conversation!.conversationId,
+        seq: nextSeq + 1,
+        role: "user",
+        content: pastedReference,
+        tokenCount: 1,
+        identityHash: buildMessageIdentityHash("user", pastedReference),
+        createdAt: "2030-01-01 00:00:00",
+      },
+    ]);
+    await engine.getConversationStore().createMessageParts(pastedMessages[1]!.messageId, [
+      {
+        sessionId,
+        partType: "text",
+        ordinal: 0,
+        textContent: pastedReference,
+        metadata: JSON.stringify({ externalizedFileId: pastedFileId }),
+      },
+    ]);
+
+    const replayedUpload = `prefix ${fileContent} suffix`;
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-pasted-reference-2"),
+      messages: [
+        makeMessage({ role: "assistant", content: anchor }),
+        makeMessage({ role: "user", content: replayedUpload }),
+        makeMessage({ role: "assistant", content: "new pasted-reference suffix" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(6);
+    expect(stored.filter((message) => message.role === "user")).toHaveLength(3);
+    expect(stored.filter((message) => message.content === anchor)).toHaveLength(2);
+    expect(stored.filter((message) => message.content === pastedReference)).toHaveLength(1);
+    expect(stored.some((message) => message.content === "new pasted-reference suffix")).toBe(true);
+  });
+
+  it("preserves legacy file-reference replays without message-part provenance", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-legacy-reference";
+    const fileText = `${"legacy reference file line\n".repeat(160)}done`;
+    const originalContent = `<file name="legacy.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-legacy-reference"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const before = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const db = (engine as unknown as {
+      db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+    }).db;
+    db.prepare(`DELETE FROM message_parts WHERE message_id = ?`).run(before[1]!.messageId);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-legacy-reference-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(7);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[4].content).toContain("[LCM File: file_");
+    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[4].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[6].content).toBe("new D");
+  });
+
+  it("deduplicates file references when summaries contain incidental file ids", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-incidental-file-id-summary";
+    const incidentalId = "[LCM File: file_deadbeefdeadbeef | incidental.md | text/markdown | 1 bytes]";
+    const fileText = `${incidentalId}\n${"incidental summary file id line\n".repeat(160)}done`;
+    const originalContent = `<file name="incidental.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-incidental-file-id-summary"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-incidental-file-id-summary-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[1].content).toContain(incidentalId);
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates file references when summaries contain incidental LCM reference blocks", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-summary-incidental-reference-block";
+    const fileText = `${"incidental reference block line\n".repeat(160)}done`;
+    const originalContent = `<file name="real.md" mime="text/markdown">${fileText}</file>`;
+    const incidentalBlock = [
+      "[LCM Tool Output: file_deadbeefdeadbeef | tool=incidental | 1 bytes]",
+      "",
+      "Exploration Summary:",
+      "incidental summary block",
+    ].join("\n");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-summary-incidental-reference-block"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    expect(conversation).not.toBeNull();
+    const storedBefore = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const realFileId = /\[LCM File:\s*(file_[a-f0-9]{16})/.exec(storedBefore[1]!.content)?.[1];
+    expect(realFileId).toBeDefined();
+    const largeFile = await engine.getSummaryStore().getLargeFile(realFileId!);
+    expect(largeFile).not.toBeNull();
+    const rewrittenContent = formatFileReference({
+      fileId: realFileId!,
+      fileName: largeFile!.fileName ?? undefined,
+      mimeType: largeFile!.mimeType ?? undefined,
+      byteSize: largeFile!.byteSize ?? 0,
+      summary: incidentalBlock,
+    });
+    const db = (engine as unknown as {
+      db: { prepare: (sql: string) => { run: (...args: unknown[]) => void } };
+    }).db;
+    db.prepare(`UPDATE large_files SET exploration_summary = ? WHERE file_id = ?`).run(
+      incidentalBlock,
+      realFileId,
+    );
+    db.prepare(`UPDATE messages SET content = ?, identity_hash = ? WHERE message_id = ?`).run(
+      rewrittenContent,
+      buildMessageIdentityHash("user", rewrittenContent),
+      storedBefore[1]!.messageId,
+    );
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-summary-incidental-reference-block-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("[LCM File: file_");
+    expect(stored[1].content).toContain(incidentalBlock);
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("preserves transcript-covered externalized single-message batches without an exact anchor", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-covered-frontier";
+    const fileText = `${"covered frontier file line\n".repeat(160)}done`;
+    const originalContent = `<file name="covered.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-covered-frontier"),
+      messages: [makeMessage({ role: "user", content: originalContent })],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const batch = [makeMessage({ role: "user", content: originalContent })];
+    const aligned = await engine.getBatchDeduplicator().alignRuntimeBatchAgainstCoveredFrontier(
+      sessionId,
+      undefined,
+      batch,
+    );
+
+    expect(aligned).toEqual(batch);
+  });
+
+  it("preserves transcript-covered externalized overlap outside the tail", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-covered-overlap-fallback";
+    const fileText = `${"covered overlap fallback file line\n".repeat(160)}done`;
+    const originalContent = `<file name="covered-overlap.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-covered-overlap-fallback"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: originalContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const batch = [makeMessage({ role: "user", content: originalContent })];
+    const aligned = await engine.getBatchDeduplicator().alignRuntimeBatchAgainstCoveredFrontier(
+      sessionId,
+      undefined,
+      batch,
+    );
+
+    expect(aligned).toEqual(batch);
+  });
+
+  it("preserves older transcript-covered externalized overlap", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-covered-old-overlap";
+    const fileText = `${"covered old overlap file line\n".repeat(160)}done`;
+    const originalContent = `<file name="covered-old.md" mime="text/markdown">${fileText}</file>`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-covered-old-overlap"),
+      messages: [
+        makeMessage({ role: "user", content: originalContent }),
+        ...Array.from({ length: 70 }, (_, index) =>
+          makeMessage({ role: "assistant", content: `old tail ${index}` }),
+        ),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const batch = [makeMessage({ role: "user", content: originalContent })];
+    const aligned = await engine.getBatchDeduplicator().alignRuntimeBatchAgainstCoveredFrontier(
+      sessionId,
+      undefined,
+      batch,
+    );
+
+    expect(aligned).toEqual(batch);
+  });
+
+  it("does not trim changed multi-file messages on a partial externalized match", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-large-file-partial-match";
+    const sharedText = `${"shared file line\n".repeat(160)}done`;
+    const oldText = `${"old second file line\n".repeat(160)}done`;
+    const newText = `${"new second file line\n".repeat(160)}done`;
+    const oldContent = [
+      `<file name="shared.md" mime="text/markdown">${sharedText}</file>`,
+      "between files",
+      `<file name="old.md" mime="text/markdown">${oldText}</file>`,
+    ].join("\n");
+    const changedContent = [
+      `<file name="shared.md" mime="text/markdown">${sharedText}</file>`,
+      "between files",
+      `<file name="new.md" mime="text/markdown">${newText}</file>`,
+    ].join("\n");
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-partial-match"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: oldContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-large-file-partial-match-2"),
+      messages: [
+        makeMessage({ role: "user", content: "old A" }),
+        makeMessage({ role: "user", content: changedContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(7);
+    expect(stored[4].content).toContain("[LCM File: file_");
+    expect(stored[4].content).not.toContain(sharedText.slice(0, 64));
+    expect(stored[4].content).not.toContain(newText.slice(0, 64));
+    expect(stored[6].content).toBe("new D");
   });
 
   it("preserves a legitimate repeated first new message", async () => {

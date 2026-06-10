@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { DatabaseSync } from "node:sqlite";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { runLcmMigrations } from "../src/db/migration.js";
 import { getLcmDbFeatures } from "../src/db/features.js";
 import { ConversationStore } from "../src/store/conversation-store.js";
@@ -164,5 +167,75 @@ describe("SummaryStore shallow-tree helpers", () => {
         summaryId: "sum_regex_recent_content_older_compaction",
       },
     ]);
+  });
+
+  it("rejects large-file dedup reads outside the configured root", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-safe-root-"));
+    const outsideRoot = mkdtempSync(join(tmpdir(), "lcm-outside-root-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-safe-large-file-read",
+        title: "Summary store safe large file read",
+      });
+      const outsideFile = join(outsideRoot, "payload.txt");
+      writeFileSync(outsideFile, "outside payload", "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_1234567890abcdef",
+        conversationId: conversation.conversationId,
+        fileName: "payload.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength("outside payload", "utf8"),
+        storageUri: outsideFile,
+        explorationSummary: "outside payload",
+      });
+
+      await expect(
+        summaryStore.largeFileContentEquals("file_1234567890abcdef", "outside payload", {
+          largeFilesDir: safeRoot,
+        }),
+      ).resolves.toBe(false);
+      await expect(
+        summaryStore.getLargeFileContent("file_1234567890abcdef", {
+          largeFilesDir: safeRoot,
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+      rmSync(outsideRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("compares large-file dedup content above the describe read cap", async () => {
+    const { conversationStore, summaryStore } = createStores();
+    const safeRoot = mkdtempSync(join(tmpdir(), "lcm-safe-large-root-"));
+    try {
+      const conversation = await conversationStore.createConversation({
+        sessionId: "summary-store-large-dedup-read",
+        title: "Summary store large dedup read",
+      });
+      const payload = `${"large payload line\n".repeat(36_000)}done`;
+      const payloadPath = join(safeRoot, "large-payload.txt");
+      writeFileSync(payloadPath, payload, "utf8");
+
+      await summaryStore.insertLargeFile({
+        fileId: "file_abcdef1234567890",
+        conversationId: conversation.conversationId,
+        fileName: "large-payload.txt",
+        mimeType: "text/plain",
+        byteSize: Buffer.byteLength(payload, "utf8"),
+        storageUri: payloadPath,
+        explorationSummary: "large payload",
+      });
+
+      await expect(
+        summaryStore.largeFileContentEquals("file_abcdef1234567890", payload, {
+          largeFilesDir: safeRoot,
+        }),
+      ).resolves.toBe(true);
+    } finally {
+      rmSync(safeRoot, { recursive: true, force: true });
+    }
   });
 });
