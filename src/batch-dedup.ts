@@ -157,6 +157,7 @@ export class BatchDeduplicator {
     const storedBatch = batch.map((m) => toStoredMessage(m));
     const batchHashes = computeBatchIdentityHashes(storedBatch);
     const rawPayloadContents = computeBatchRawPayloadContents(batch, storedBatch);
+    const batchCreatedAtMs = batch.map(resolveMessageCreatedAtMs);
 
     // When the DB already has more messages than the incoming batch,
     // the batch may be a tail-only replay. Try tail-matching first,
@@ -168,6 +169,7 @@ export class BatchDeduplicator {
         storedBatch,
         batchHashes,
         rawPayloadContents,
+        batchCreatedAtMs,
         storedMessageCount,
         lastDbIdentityHash,
         options,
@@ -185,6 +187,7 @@ export class BatchDeduplicator {
         storedBatch,
         batchHashes,
         rawPayloadContents,
+        batchCreatedAtMs,
         storedMessageCount,
         "prefix-mismatch",
         { onNoOverlap: "ingest" },
@@ -236,6 +239,7 @@ export class BatchDeduplicator {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     batchHashes: string[],
     rawPayloadContents: Array<string | null>,
+    batchCreatedAtMs: Array<number | null>,
     storedMessageCount: number,
     lastDbIdentityHash: string,
     options?: { oversizedNoOverlap?: "ingest" | "skip" },
@@ -275,20 +279,20 @@ export class BatchDeduplicator {
       }
     }
 
-    // Fall back to suffix matching. If the DB is already longer than the
-    // incoming afterTurn batch and no suffix overlap exists, fail closed:
-    // importing the whole short batch as new would duplicate/pollute LCM with
-    // stale runtime tail snapshots. The transcript reconcile path runs before
-    // this and is responsible for importing genuine missing JSONL tail turns.
+    // Fall back to suffix matching. Outside the transcript-covered path, a
+    // short runtime batch with no overlap may be a genuine live turn after a
+    // missing/unreadable transcript reconcile. Ingest on no-overlap unless the
+    // caller has a stronger proof source and explicitly asks to skip.
     return this.deduplicateSuffixFallback(
       conversationId,
       batch,
       storedBatch,
       batchHashes,
       rawPayloadContents,
+      batchCreatedAtMs,
       storedMessageCount,
       "oversized",
-      { onNoOverlap: options?.oversizedNoOverlap ?? "skip" },
+      { onNoOverlap: options?.oversizedNoOverlap ?? "ingest" },
     );
   }
 
@@ -303,6 +307,7 @@ export class BatchDeduplicator {
     storedBatch: ReturnType<typeof toStoredMessage>[],
     batchHashes: string[],
     rawPayloadContents: Array<string | null>,
+    batchCreatedAtMs: Array<number | null>,
     storedMessageCount: number,
     context: string,
     options?: { onNoOverlap?: "ingest" | "skip" },
@@ -383,11 +388,28 @@ export class BatchDeduplicator {
       return batch;
     }
 
-    const onNoOverlap = options?.onNoOverlap ?? "skip";
+    const onNoOverlap = options?.onNoOverlap ?? "ingest";
     if (onNoOverlap === "skip") {
       this.deps.log.warn(
         `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
           `no overlap found — fail-closed skipping full batch`,
+      );
+      return [];
+    }
+
+    if (
+      await this.batchMatchesPersistedTailByTimestamp(
+        allStored,
+        allRecentHashes,
+        storedBatch,
+        batchHashes,
+        rawPayloadContents,
+        batchCreatedAtMs,
+      )
+    ) {
+      this.deps.log.warn(
+        `[lcm] dedup: ${context}, storedCount=${storedMessageCount} batchLen=${batch.length}, ` +
+          `no suffix overlap found but batch matches timestamp-proven persisted tail — skipping full batch`,
       );
       return [];
     }
@@ -397,6 +419,54 @@ export class BatchDeduplicator {
         `no overlap found — ingesting full batch`,
     );
     return batch;
+  }
+
+  private async batchMatchesPersistedTailByTimestamp(
+    storedMessages: MessageRecord[],
+    storedHashes: string[],
+    incomingBatch: StoredMessage[],
+    incomingHashes: string[],
+    incomingRawPayloadContents: Array<string | null>,
+    incomingCreatedAtMs: Array<number | null>,
+  ): Promise<boolean> {
+    if (
+      incomingBatch.length === 0 ||
+      storedMessages.length !== storedHashes.length ||
+      storedMessages.length < incomingBatch.length
+    ) {
+      return false;
+    }
+
+    let storedIndex = storedMessages.length - 1;
+    for (let batchIndex = incomingBatch.length - 1; batchIndex >= 0; batchIndex -= 1) {
+      let matched = false;
+      while (storedIndex >= 0) {
+        const match = await this.matchStoredMessageToIncoming(
+          storedMessages[storedIndex]!,
+          incomingBatch[batchIndex]!,
+          incomingHashes[batchIndex]!,
+          storedHashes[storedIndex]!,
+          incomingRawPayloadContents[batchIndex],
+        );
+        if (
+          match &&
+          match !== "unproven-externalized" &&
+          messageTimestampMatchesPersistedRow(
+            incomingCreatedAtMs[batchIndex],
+            storedMessages[storedIndex]!,
+          )
+        ) {
+          matched = true;
+          storedIndex -= 1;
+          break;
+        }
+        storedIndex -= 1;
+      }
+      if (!matched) {
+        return false;
+      }
+    }
+    return true;
   }
 
   private async matchStoredMessageToIncoming(
@@ -455,16 +525,13 @@ export class BatchDeduplicator {
         return null;
       }
     }
-    if (references.some((reference) => reference.reference.startsWith("[LCM Tool Output:"))) {
-      return null;
-    }
     const provenanceBacked =
       proofKeys.size > 0 &&
       references.every((reference) => proofKeys.has(referenceProofKey(reference)));
 
     if (
       references.length === 1 &&
-      references[0]!.reference.startsWith("[LCM Raw Payload:") &&
+      isWholeIncomingReference(references[0]!) &&
       (await this.referenceMatchesWholeIncoming(
         storedMessage,
         incoming,
@@ -479,7 +546,7 @@ export class BatchDeduplicator {
     if (fileBlocks.length === 0) {
       return (
         references.length === 1 &&
-        references[0]!.reference.startsWith("[LCM Raw Payload:") &&
+        isWholeIncomingReference(references[0]!) &&
         (await this.referenceMatchesWholeIncoming(
           storedMessage,
           incoming,
@@ -553,6 +620,20 @@ export class BatchDeduplicator {
           }
         }
       }
+      if (
+        metadata.toolOutputExternalized === true &&
+        metadata.externalizationReason === "large_tool_result" &&
+        typeof metadata.externalizedFileId === "string"
+      ) {
+        proofKeys.add(`tool:${metadata.externalizedFileId}`);
+      }
+      if (
+        metadata.imageExternalized === true &&
+        metadata.externalizationReason === "native_image" &&
+        typeof metadata.externalizedFileId === "string"
+      ) {
+        proofKeys.add(`image:${metadata.externalizedFileId}`);
+      }
     }
 
     return proofKeys;
@@ -570,6 +651,17 @@ export class BatchDeduplicator {
     }
     if (this.formatExternalizedReference(reference, largeFile, storedMessage) !== storedMessage.content) {
       return false;
+    }
+    if (isImageReference(reference)) {
+      if (!largeFile.mimeType?.toLowerCase().startsWith("image/")) {
+        return false;
+      }
+      const incomingImage = extractSingleNativeImageBuffer(incomingRawPayloadContent ?? incoming.content);
+      return incomingImage
+        ? this.summaryStore.largeFileBufferEquals(reference.fileId, incomingImage, {
+            largeFilesDir: this.largeFilesDir,
+          })
+        : false;
     }
     const contentToCompare =
       reference.reference.startsWith("[LCM Raw Payload:") && incomingRawPayloadContent != null
@@ -672,6 +764,10 @@ export class BatchDeduplicator {
     largeFile: LargeFileRecord,
     storedMessage: MessageRecord,
   ): string {
+    if (isImageReference(reference)) {
+      return reference.reference;
+    }
+
     if (reference.reference.startsWith("[LCM Tool Output:")) {
       return formatToolOutputReference({
         fileId: largeFile.fileId,
@@ -725,6 +821,37 @@ function computeBatchRawPayloadContents(
   });
 }
 
+function resolveMessageCreatedAtMs(message: AgentMessage): number | null {
+  const raw = message as unknown as Record<string, unknown>;
+  const value = raw.timestamp ?? raw.createdAt ?? raw.created_at;
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? Math.floor(value / 1000) * 1000 : null;
+  }
+  if (value instanceof Date) {
+    const time = value.getTime();
+    return Number.isFinite(time) ? Math.floor(time / 1000) * 1000 : null;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const time = Date.parse(value);
+    return Number.isFinite(time) ? Math.floor(time / 1000) * 1000 : null;
+  }
+  return null;
+}
+
+function messageTimestampMatchesPersistedRow(
+  incomingCreatedAtMs: number | null | undefined,
+  storedMessage: MessageRecord,
+): boolean {
+  if (incomingCreatedAtMs == null) {
+    return false;
+  }
+  const storedCreatedAtMs = storedMessage.createdAt.getTime();
+  if (!Number.isFinite(storedCreatedAtMs)) {
+    return false;
+  }
+  return incomingCreatedAtMs <= storedCreatedAtMs;
+}
+
 type ExternalizedReference = {
   fileId: string;
   reference: string;
@@ -756,6 +883,18 @@ function extractExternalizedReferences(content: string): ExternalizedReference[]
     });
     referencePattern.lastIndex = markerIndex;
   }
+  const imageReferencePattern =
+    /\[(?:(?:User|System|Tool|Assistant) image|Image): [^\]]*?\bLCM file:\s*(file_[a-f0-9]{16})\]/gi;
+  while ((match = imageReferencePattern.exec(content)) !== null) {
+    const fileId = match[1]?.toLowerCase();
+    if (!fileId) continue;
+    references.push({
+      fileId,
+      reference: match[0],
+      formattedReference: match[0],
+      end: imageReferencePattern.lastIndex,
+    });
+  }
   return references;
 }
 
@@ -771,7 +910,79 @@ function referenceProofKey(reference: ExternalizedReference): string {
   if (reference.reference.startsWith("[LCM File:")) {
     return `file:${reference.fileId}`;
   }
+  if (reference.reference.startsWith("[LCM Tool Output:")) {
+    return `tool:${reference.fileId}`;
+  }
+  if (isImageReference(reference)) {
+    return `image:${reference.fileId}`;
+  }
   return `other:${reference.fileId}`;
+}
+
+function isWholeIncomingReference(reference: ExternalizedReference): boolean {
+  return (
+    reference.reference.startsWith("[LCM Raw Payload:") ||
+    reference.reference.startsWith("[LCM Tool Output:") ||
+    isImageReference(reference)
+  );
+}
+
+function isImageReference(reference: ExternalizedReference): boolean {
+  return /^\[(?:(?:User|System|Tool|Assistant) image|Image): /i.test(reference.reference);
+}
+
+function extractSingleNativeImageBuffer(content: string): Buffer | null {
+  const parsed = parseJsonPayload(content);
+  const imageBlocks = parsed === undefined
+    ? extractNativeImageBuffersFromValue(content)
+    : extractNativeImageBuffersFromValue(parsed);
+  return imageBlocks.length === 1 ? imageBlocks[0]! : null;
+}
+
+function extractNativeImageBuffersFromValue(value: unknown): Buffer[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => extractNativeImageBuffersFromValue(entry));
+  }
+  if (!value || typeof value !== "object") {
+    return [];
+  }
+
+  const record = value as Record<string, unknown>;
+  if (record.type === "image") {
+    const data = typeof record.data === "string" ? record.data : undefined;
+    const decoded = data ? decodeBase64ImageData(data) : null;
+    return decoded ? [decoded] : [];
+  }
+
+  return [];
+}
+
+function decodeBase64ImageData(rawData: string): Buffer | null {
+  const dataUrlMatch = rawData.match(/^data:([^;,]+);base64,(.*)$/s);
+  const base64Data = (dataUrlMatch?.[2] ?? rawData).replace(/\s+/g, "");
+  if (!base64Data || !/^[A-Za-z0-9+/]+={0,2}$/.test(base64Data)) {
+    return null;
+  }
+  try {
+    return Buffer.from(base64Data, "base64");
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonPayload(content: string): unknown {
+  const trimmed = content.trim();
+  if (
+    !((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+      (trimmed.startsWith("[") && trimmed.endsWith("]")))
+  ) {
+    return undefined;
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return undefined;
+  }
 }
 
 function parsePartMetadata(metadata: string | null): Record<string, unknown> | null {

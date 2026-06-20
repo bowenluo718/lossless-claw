@@ -2811,6 +2811,7 @@ export class LcmContextEngine implements ContextEngine {
               sessionKey: params.sessionKey,
               message,
               isHeartbeat: params.isHeartbeat,
+              createdAt: resolveTranscriptMessageCreatedAt(message),
             });
             if (result.ingested) {
               ingestedCount += 1;
@@ -2941,7 +2942,7 @@ export class LcmContextEngine implements ContextEngine {
         params.sessionKey,
         newMessages,
         {
-          oversizedNoOverlap: transcriptReconcileResult.importedMessages > 0 ? "ingest" : "skip",
+          oversizedNoOverlap: "ingest",
         },
       );
     }

@@ -1577,7 +1577,18 @@ export class SummaryStore {
     content: string,
     options: LargeFileReadOptions,
   ): Promise<boolean> {
-    const byteSize = Buffer.byteLength(content, "utf8");
+    return this.largeFileBufferEquals(fileId, Buffer.from(content, "utf8"), options);
+  }
+
+  /**
+   * Return true when one externalized binary/text payload exactly matches bytes.
+   */
+  async largeFileBufferEquals(
+    fileId: string,
+    content: Buffer,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
+    const byteSize = content.byteLength;
     const row = this.db
       .prepare(
         `SELECT storage_uri
@@ -1591,7 +1602,7 @@ export class SummaryStore {
       return false;
     }
 
-    return this.validatedLargeFileContentEquals(row.storage_uri, content, options);
+    return this.validatedLargeFileBufferEquals(row.storage_uri, content, options);
   }
 
   /** Read a persisted large-file payload from disk, returning null when unavailable. */
@@ -1619,7 +1630,18 @@ export class SummaryStore {
     expectedContent: string,
     options: LargeFileReadOptions,
   ): Promise<boolean> {
-    const expected = Buffer.from(expectedContent, "utf8");
+    return this.validatedLargeFileBufferEquals(
+      storageUri,
+      Buffer.from(expectedContent, "utf8"),
+      options,
+    );
+  }
+
+  private async validatedLargeFileBufferEquals(
+    storageUri: string,
+    expected: Buffer,
+    options: LargeFileReadOptions,
+  ): Promise<boolean> {
     try {
       const file = await this.openValidatedLargeFile(storageUri, options);
       if (!file) {

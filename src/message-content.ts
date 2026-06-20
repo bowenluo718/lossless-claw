@@ -618,6 +618,7 @@ export function buildMessageParts(params: {
           typeof metadataRecord?.originalByteSize === "number"
             ? metadataRecord.originalByteSize
             : undefined,
+        imageExternalized: safeBoolean(metadataRecord?.imageExternalized),
         toolOutputExternalized: safeBoolean(metadataRecord?.toolOutputExternalized),
         externalizationReason: safeString(metadataRecord?.externalizationReason),
         rawType: rawBlockType,

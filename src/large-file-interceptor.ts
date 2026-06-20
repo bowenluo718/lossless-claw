@@ -329,7 +329,14 @@ export class LargeFileInterceptor {
         label,
       });
 
-      rewrittenContent.push({ type: "text", text: externalized.reference });
+      rewrittenContent.push({
+        type: "text",
+        text: externalized.reference,
+        externalizedFileId: externalized.fileId,
+        originalByteSize: externalized.byteSize,
+        imageExternalized: true,
+        externalizationReason: "native_image",
+      });
       fileIds.push(externalized.fileId);
       changed = true;
     }

@@ -484,7 +484,7 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(stored.map((m) => m.content)).toEqual(["hello", "world"]);
   });
 
-  it("fails closed for oversized no-overlap afterTurn batches", async () => {
+  it("ingests oversized no-overlap afterTurn batches without transcript coverage", async () => {
     const warnLog = vi.fn();
     const engine = createEngineWithDepsOverrides({
       log: {
@@ -494,11 +494,11 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
         debug: vi.fn(),
       },
     });
-    const sessionId = "dedup-oversized-no-overlap-fail-closed";
+    const sessionId = "dedup-oversized-no-overlap-ingest";
 
     await engine.afterTurn({
       sessionId,
-      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed"),
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-ingest"),
       messages: [
         makeMessage({ role: "user", content: "old A" }),
         makeMessage({ role: "assistant", content: "old B" }),
@@ -508,14 +508,12 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
       tokenBudget: 4096,
     });
 
-    // Simulates a short afterTurn runtime snapshot that has no overlap with
-    // the longer stored LCM conversation. Before this guard, LCM imported the
-    // whole batch as fresh rows and polluted context; the transcript reconcile
-    // path is responsible for genuine missing JSONL tail imports before this
-    // dedup check runs.
+    // Simulates a short live afterTurn runtime snapshot with no overlap after
+    // a missing/unreadable transcript reconcile. Without transcript coverage,
+    // skipping here silently loses live messages.
     await engine.afterTurn({
       sessionId,
-      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-fail-closed-2"),
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-ingest-2"),
       messages: [
         makeMessage({ role: "user", content: "unanchored user" }),
         makeMessage({ role: "assistant", content: "unanchored assistant" }),
@@ -526,9 +524,134 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored.map((m) => m.content)).toEqual(["old A", "old B", "old C"]);
+    expect(stored.map((m) => m.content)).toEqual([
+      "old A",
+      "old B",
+      "old C",
+      "unanchored user",
+      "unanchored assistant",
+    ]);
     expect(warnLog).toHaveBeenCalledWith(
-      `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — fail-closed skipping full batch`,
+      `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — ingesting full batch`,
+    );
+  });
+
+  it("skips oversized no-overlap batches that match the tail around auto-compaction summaries", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-oversized-no-overlap-all-persisted";
+    const oldBTimestamp = Date.UTC(2026, 0, 1, 0, 0, 1);
+    const lastDTimestamp = Date.UTC(2026, 0, 1, 0, 0, 4);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-all-persisted"),
+      messages: [
+        { role: "user", content: "old A", timestamp: Date.UTC(2026, 0, 1, 0, 0, 0) } as AgentMessage,
+        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
+        { role: "user", content: "old C", timestamp: Date.UTC(2026, 0, 1, 0, 0, 2) } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-all-persisted-summary"),
+      messages: [
+        { role: "user", content: "old A", timestamp: Date.UTC(2026, 0, 1, 0, 0, 0) } as AgentMessage,
+        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
+        { role: "user", content: "old C", timestamp: Date.UTC(2026, 0, 1, 0, 0, 2) } as AgentMessage,
+        { role: "assistant", content: "last D", timestamp: lastDTimestamp } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+      autoCompactionSummary: "[summary] compacted older context",
+    });
+
+    // The marked summary row breaks suffix alignment, but the runtime rows
+    // match the persisted tail around that summary. This is a stale replay, not
+    // a live no-overlap turn.
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-all-persisted-2"),
+      messages: [
+        { role: "assistant", content: "old B", timestamp: oldBTimestamp } as AgentMessage,
+        { role: "assistant", content: "last D", timestamp: lastDTimestamp } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "old A",
+      "old B",
+      "old C",
+      "[summary] compacted older context",
+      "last D",
+    ]);
+    expect(warnLog).toHaveBeenCalledWith(
+      `[lcm] dedup: oversized, storedCount=5 batchLen=2, no suffix overlap found but batch matches timestamp-proven persisted tail — skipping full batch`,
+    );
+  });
+
+  it("ingests oversized no-overlap repeated content without auto-compaction summary proof", async () => {
+    const warnLog = vi.fn();
+    const engine = createEngineWithDepsOverrides({
+      log: {
+        info: vi.fn(),
+        warn: warnLog,
+        error: vi.fn(),
+        debug: vi.fn(),
+      },
+    });
+    const sessionId = "dedup-oversized-no-overlap-repeated-live";
+    const firstDeployTimestamp = Date.UTC(2026, 0, 1, 0, 1, 0);
+    const repeatedDeployTimestamp = Date.UTC(2026, 0, 1, 0, 2, 0);
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-repeated-live"),
+      messages: [
+        { role: "user", content: "deploy?", timestamp: firstDeployTimestamp } as AgentMessage,
+        { role: "assistant", content: "done", timestamp: firstDeployTimestamp + 1000 } as AgentMessage,
+        { role: "assistant", content: "later tail", timestamp: firstDeployTimestamp + 2000 } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-oversized-no-overlap-repeated-live-2"),
+      messages: [
+        { role: "user", content: "deploy?", timestamp: repeatedDeployTimestamp } as AgentMessage,
+        { role: "assistant", content: "done", timestamp: repeatedDeployTimestamp + 1000 } as AgentMessage,
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored.map((m) => m.content)).toEqual([
+      "deploy?",
+      "done",
+      "later tail",
+      "deploy?",
+      "done",
+    ]);
+    expect(warnLog).toHaveBeenCalledWith(
+      `[lcm] dedup: oversized, storedCount=3 batchLen=2, no overlap found — ingesting full batch`,
     );
   });
 
@@ -1023,7 +1146,7 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     expect(getLargeFileContentSpy).not.toHaveBeenCalled();
   });
 
-  it("preserves anchored tool output reference replays without metadata proof", async () => {
+  it("deduplicates provenance-backed anchored tool output reference replays", async () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "dedup-large-file-tool-output-replay";
     const toolOutput = `${"tool output replay line\n".repeat(160)}done`;
@@ -1055,12 +1178,54 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
-    expect(stored).toHaveLength(7);
+    expect(stored).toHaveLength(4);
     expect(stored[1].content).toContain("[LCM Tool Output: file_");
-    expect(stored[4].content).toContain("[LCM Tool Output: file_");
     expect(stored[1].content).not.toContain(toolOutput.slice(0, 64));
-    expect(stored[4].content).not.toContain(toolOutput.slice(0, 64));
-    expect(stored[6].content).toBe("new D");
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates provenance-backed anchored native image reference replays", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-native-image-replay";
+    const base64Image = `iVBOR${"A".repeat(600)}`;
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-native-image-replay"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({
+          role: "user",
+          content: [{ type: "image", data: base64Image, mimeType: "image/png" }],
+        }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-native-image-replay-2"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({
+          role: "user",
+          content: [{ type: "image", data: base64Image, mimeType: "image/png" }],
+        }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("[User image: user-image.png");
+    expect(stored[1].content).not.toContain(base64Image.slice(0, 32));
+    expect(stored[3].content).toBe("new D");
   });
 
   it("preserves externalized-only repeated file prefixes when a new suffix is present", async () => {
