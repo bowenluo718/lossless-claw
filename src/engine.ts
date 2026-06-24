@@ -2590,6 +2590,32 @@ export class LcmContextEngine implements ContextEngine {
       return { ingested: false };
     }
 
+    // Delivery-mirror dedup: OpenClaw writes two entries per assistant turn —
+    // the model response (with thinking + text) and a delivery-mirror (text
+    // only, model="delivery-mirror"). Both share the same identity_hash
+    // because toStoredMessage strips thinking, but they have different
+    // transcript entry ids, so the entry-id idempotency check above does not
+    // catch the mirror. When the incoming message is a delivery-mirror, skip
+    // it if the immediately previous row is a reasoned assistant response with
+    // the same identity hash (the response entry was ingested first).
+    const rawModel = (message as unknown as Record<string, unknown>).model;
+    if (
+      typeof rawModel === "string" &&
+      rawModel === "delivery-mirror" &&
+      stored.role === "assistant" &&
+      stored.content.trim().length > 0
+    ) {
+      if (
+        await this.conversationStore.hasPreviousReasonedMessageByIdentity(
+          conversationId,
+          stored.role,
+          stored.content,
+        )
+      ) {
+        return { ingested: false };
+      }
+    }
+
     let messageForParts = message;
 
     const nativeImageIntercepted = await this.largeFileInterceptor.interceptNativeImageBlocks({

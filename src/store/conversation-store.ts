@@ -1003,6 +1003,51 @@ export class ConversationStore {
     return row?.found === 1;
   }
 
+  /**
+   * Whether the newest persisted row has the same identity hash and preserved
+   * reasoning content. Used to dedup adjacent delivery-mirror messages whose
+   * text content is already covered by the immediately preceding response entry.
+   */
+  async hasPreviousReasonedMessageByIdentity(
+    conversationId: ConversationId,
+    role: MessageRole,
+    content: string,
+  ): Promise<boolean> {
+    const identityHash = buildMessageIdentityHash(role, content);
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS found
+       FROM (
+         SELECT message_id, identity_hash, role, content
+         FROM messages
+         WHERE conversation_id = ?
+         ORDER BY seq DESC
+         LIMIT 1
+       ) AS newest
+       WHERE newest.identity_hash = ?
+         AND newest.role = ?
+         AND newest.content = ?
+         AND EXISTS (
+           SELECT 1
+           FROM message_parts AS part
+           WHERE part.message_id = newest.message_id
+             AND (
+               part.part_type = 'reasoning'
+               OR (
+                 part.metadata IS NOT NULL
+                 AND json_valid(part.metadata)
+                 AND json_extract(part.metadata, '$.topLevelReasoningField') = 'reasoning_content'
+                 AND json_type(part.metadata, '$.topLevelReasoningContent') = 'text'
+                 AND length(json_extract(part.metadata, '$.topLevelReasoningContent')) > 0
+               )
+             )
+         )
+       LIMIT 1`,
+      )
+      .get(conversationId, identityHash, role, content) as unknown as { found?: number } | undefined;
+    return row?.found === 1;
+  }
+
   async countMessagesByIdentityHash(
     conversationId: ConversationId,
     role: MessageRole,
