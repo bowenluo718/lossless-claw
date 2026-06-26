@@ -1122,8 +1122,8 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
   it("deduplicates raw payload replays after file block rewriting", async () => {
     const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
     const sessionId = "dedup-large-file-raw-payload-file-block-replay";
-    const fileText = `${"raw payload file block replay line\n".repeat(160)}done`;
-    const surroundingText = `${"raw payload surrounding text\n".repeat(80)}done`;
+    const fileText = `${"alpha beta gamma delta ".repeat(6)}done`;
+    const surroundingText = "short";
     const rawContent = [
       surroundingText,
       `<file name="raw-file.md" mime="text/markdown">${fileText}</file>`,
@@ -1158,13 +1158,17 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
 
     const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    const rawPayloadFileId = /\[LCM Raw Payload:\s*(file_[a-f0-9]{16})/.exec(stored[1]!.content)?.[1];
+    expect(rawPayloadFileId).toBeTruthy();
+    const rawPayloadFile = await engine.getSummaryStore().getLargeFile(rawPayloadFileId!);
+    expect(rawPayloadFile?.byteSize).toBeGreaterThan(Buffer.byteLength(rawContent, "utf8"));
     expect(stored).toHaveLength(4);
     expect(stored[1].content).toContain("[LCM Raw Payload: file_");
-    expect(stored[1].content).not.toContain(fileText.slice(0, 64));
+    expect(stored[1].content).not.toContain("<file name=");
     expect(stored[3].content).toBe("new D");
     expect(getLargeFileContentSpy).toHaveBeenCalledWith(expect.any(String), {
       largeFilesDir: expect.any(String),
-      maxBytes: Buffer.byteLength(rawContent, "utf8"),
+      maxBytes: rawPayloadFile!.byteSize,
     });
   });
 
@@ -1280,6 +1284,99 @@ describe("LcmContextEngine afterTurn dedup guard", () => {
     const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
     expect(stored).toHaveLength(4);
     expect(stored[1].content).toContain("[User image: user-image.png");
+    expect(stored[1].content).not.toContain(base64Image.slice(0, 32));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates provenance-backed mixed multi-image reference replays", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 1000 });
+    const sessionId = "dedup-native-image-mixed-multi-replay";
+    const firstImage = `iVBOR${"B".repeat(600)}`;
+    const secondImage = `iVBOR${"C".repeat(600)}`;
+    const mixedContent = [
+      { type: "text", text: "before image" },
+      { type: "image", data: firstImage, mimeType: "image/png" },
+      { type: "text", text: "between images" },
+      { type: "image", data: secondImage, mimeType: "image/png" },
+      { type: "text", text: "after image" },
+    ];
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-native-image-mixed-multi-replay"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "user", content: mixedContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-native-image-mixed-multi-replay-2"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "user", content: mixedContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("before image");
+    expect(stored[1].content).toContain("between images");
+    expect(stored[1].content).toContain("after image");
+    expect(stored[1].content.match(/\[User image: user-image\.png/g)).toHaveLength(2);
+    expect(stored[1].content).not.toContain(firstImage.slice(0, 32));
+    expect(stored[1].content).not.toContain(secondImage.slice(0, 32));
+    expect(stored[3].content).toBe("new D");
+  });
+
+  it("deduplicates raw payload replays after native image rewriting", async () => {
+    const engine = createEngineWithConfig({ largeFileTokenThreshold: 20 });
+    const sessionId = "dedup-native-image-raw-payload-replay";
+    const base64Image = `iVBOR${"D".repeat(600)}`;
+    const mixedContent = [
+      { type: "text", text: "raw payload image prefix" },
+      { type: "image", data: base64Image, mimeType: "image/png" },
+      { type: "text", text: "raw payload image suffix" },
+    ];
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-native-image-raw-payload-replay"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "user", content: mixedContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    await engine.afterTurn({
+      sessionId,
+      sessionFile: createSessionFilePath("dedup-native-image-raw-payload-replay-2"),
+      messages: [
+        makeMessage({ role: "assistant", content: "old A" }),
+        makeMessage({ role: "user", content: mixedContent }),
+        makeMessage({ role: "assistant", content: "old C" }),
+        makeMessage({ role: "assistant", content: "new D" }),
+      ],
+      prePromptMessageCount: 0,
+      tokenBudget: 4096,
+    });
+
+    const conversation = await engine.getConversationStore().getConversationBySessionId(sessionId);
+    const stored = await engine.getConversationStore().getMessages(conversation!.conversationId);
+    expect(stored).toHaveLength(4);
+    expect(stored[1].content).toContain("[LCM Raw Payload: file_");
     expect(stored[1].content).not.toContain(base64Image.slice(0, 32));
     expect(stored[3].content).toBe("new D");
   });

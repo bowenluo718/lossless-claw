@@ -14,6 +14,7 @@ import {
   type FileBlock,
 } from "./large-files.js";
 import {
+  extractStructuredText,
   RAW_PAYLOAD_EXTERNALIZATION_REASON,
   serializeRawPayloadContent,
   toStoredMessage,
@@ -472,6 +473,15 @@ export class BatchDeduplicator {
 
     const fileBlocks = parseFileBlocks(incoming.content);
     if (fileBlocks.length === 0) {
+      if (
+        await this.incomingNativeImagesMatchStoredContent(
+          storedMessage.content,
+          references,
+          incomingRawPayloadContent,
+        )
+      ) {
+        return provenanceBacked ? "externalized" : "unproven-externalized";
+      }
       return (
         references.length === 1 &&
         isWholeIncomingReference(references[0]!) &&
@@ -509,6 +519,38 @@ export class BatchDeduplicator {
       return provenanceBacked ? "externalized" : "unproven-externalized";
     }
     return null;
+  }
+
+  private async incomingNativeImagesMatchStoredContent(
+    storedContent: string,
+    references: ExternalizedReference[],
+    incomingRawPayloadContent?: string | null,
+  ): Promise<boolean> {
+    if (incomingRawPayloadContent == null || !references.every(isImageReference)) {
+      return false;
+    }
+    const blocks = extractNativeImageReplayBlocks(incomingRawPayloadContent);
+    if (!blocks) {
+      return false;
+    }
+
+    let referenceIndex = 0;
+    const rewritten: string[] = [];
+    for (const block of blocks) {
+      // Mirror extractStructuredText's array join while replacing each replayed
+      // native image with the exact stored reference after byte proof.
+      if (block.kind === "text") {
+        rewritten.push(block.text);
+        continue;
+      }
+      const reference = references[referenceIndex];
+      if (!reference || !(await this.referenceMatchesNativeImage(reference, block.buffer))) {
+        return false;
+      }
+      rewritten.push(reference.reference);
+      referenceIndex += 1;
+    }
+    return referenceIndex === references.length && rewritten.join("\n") === storedContent;
   }
 
   private async getStoredExternalizedReferenceProofKeys(
@@ -581,14 +623,9 @@ export class BatchDeduplicator {
       return false;
     }
     if (isImageReference(reference)) {
-      if (!largeFile.mimeType?.toLowerCase().startsWith("image/")) {
-        return false;
-      }
       const incomingImage = extractSingleNativeImageBuffer(incomingRawPayloadContent ?? incoming.content);
       return incomingImage
-        ? this.summaryStore.largeFileBufferEquals(reference.fileId, incomingImage, {
-            largeFilesDir: this.largeFilesDir,
-          })
+        ? this.referenceMatchesNativeImage(reference, incomingImage)
         : false;
     }
     const contentToCompare =
@@ -604,24 +641,103 @@ export class BatchDeduplicator {
     }
     if (
       !reference.reference.startsWith("[LCM Raw Payload:") ||
-      incomingRawPayloadContent == null ||
-      parseFileBlocks(incomingRawPayloadContent).length === 0
+      incomingRawPayloadContent == null
     ) {
+      return false;
+    }
+    const hasFileBlocks = parseFileBlocks(incomingRawPayloadContent).length > 0;
+    const hasNativeImages = rawPayloadHasNativeImages(incomingRawPayloadContent);
+    if (!hasFileBlocks && !hasNativeImages) {
       return false;
     }
 
     const storedPayload = await this.summaryStore.getLargeFileContent(reference.fileId, {
       largeFilesDir: this.largeFilesDir,
-      maxBytes: Buffer.byteLength(incomingRawPayloadContent, "utf8"),
+      maxBytes: largeFile.byteSize ?? Buffer.byteLength(incomingRawPayloadContent, "utf8"),
     });
     if (!storedPayload) {
       return false;
     }
-    const rewrittenPayload = await this.rewriteIncomingFileBlocksFromStoredPayload(
-      incomingRawPayloadContent,
-      storedPayload,
-    );
-    return rewrittenPayload === storedPayload;
+    if (hasFileBlocks) {
+      const rewrittenPayload = await this.rewriteIncomingFileBlocksFromStoredPayload(
+        incomingRawPayloadContent,
+        storedPayload,
+      );
+      if (rewrittenPayload === storedPayload) {
+        return true;
+      }
+    }
+    return hasNativeImages
+      ? this.incomingNativeImageRawPayloadMatchesStoredPayload(
+          incomingRawPayloadContent,
+          storedPayload,
+        )
+      : false;
+  }
+
+  private async referenceMatchesNativeImage(
+    reference: ExternalizedReference,
+    incomingImage: Buffer,
+  ): Promise<boolean> {
+    const largeFile = await this.summaryStore.getLargeFile(reference.fileId);
+    if (!largeFile?.mimeType?.toLowerCase().startsWith("image/")) {
+      return false;
+    }
+    return this.summaryStore.largeFileBufferEquals(reference.fileId, incomingImage, {
+      largeFilesDir: this.largeFilesDir,
+    });
+  }
+
+  private async incomingNativeImageRawPayloadMatchesStoredPayload(
+    incomingRawPayloadContent: string,
+    storedPayload: string,
+  ): Promise<boolean> {
+    const incoming = parseJsonPayload(incomingRawPayloadContent);
+    const stored = parseJsonPayload(storedPayload);
+    if (!Array.isArray(incoming) || !Array.isArray(stored) || incoming.length !== stored.length) {
+      return false;
+    }
+
+    for (let index = 0; index < incoming.length; index += 1) {
+      const incomingEntry = incoming[index];
+      const storedEntry = stored[index];
+      const incomingImage = extractSingleNativeImageBufferFromValue(incomingEntry);
+      if (!incomingImage) {
+        // Non-image raw blocks must remain byte-for-byte JSON equivalent.
+        if (isNativeImageEntry(incomingEntry) || JSON.stringify(incomingEntry) !== JSON.stringify(storedEntry)) {
+          return false;
+        }
+        continue;
+      }
+      if (!(await this.storedRawPayloadImageEntryMatches(storedEntry, incomingImage))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private async storedRawPayloadImageEntryMatches(
+    storedEntry: unknown,
+    incomingImage: Buffer,
+  ): Promise<boolean> {
+    if (!storedEntry || typeof storedEntry !== "object" || Array.isArray(storedEntry)) {
+      return false;
+    }
+    const record = storedEntry as Record<string, unknown>;
+    if (
+      record.type !== "text" ||
+      record.imageExternalized !== true ||
+      record.externalizationReason !== "native_image" ||
+      typeof record.text !== "string" ||
+      typeof record.externalizedFileId !== "string"
+    ) {
+      return false;
+    }
+    const references = extractExternalizedReferences(record.text);
+    if (references.length !== 1 || references[0]!.fileId !== record.externalizedFileId) {
+      return false;
+    }
+    return this.referenceMatchesNativeImage(references[0]!, incomingImage);
   }
 
   private async rewriteIncomingFileBlocksFromStoredPayload(
@@ -757,6 +873,10 @@ type ExternalizedReference = {
   end: number;
 };
 
+type NativeImageReplayBlock =
+  | { kind: "text"; text: string }
+  | { kind: "image"; buffer: Buffer };
+
 function extractExternalizedReferences(content: string): ExternalizedReference[] {
   const references: ExternalizedReference[] = [];
   const summaryMarker = "\n\nExploration Summary:";
@@ -835,6 +955,52 @@ function extractSingleNativeImageBuffer(content: string): Buffer | null {
     ? extractNativeImageBuffersFromValue(content)
     : extractNativeImageBuffersFromValue(parsed);
   return imageBlocks.length === 1 ? imageBlocks[0]! : null;
+}
+
+function extractNativeImageReplayBlocks(content: string): NativeImageReplayBlock[] | null {
+  const parsed = parseJsonPayload(content);
+  if (!Array.isArray(parsed)) {
+    return null;
+  }
+
+  const blocks: NativeImageReplayBlock[] = [];
+  let sawImage = false;
+  for (const entry of parsed) {
+    const image = extractSingleNativeImageBufferFromValue(entry);
+    if (image) {
+      blocks.push({ kind: "image", buffer: image });
+      sawImage = true;
+      continue;
+    }
+    if (isNativeImageEntry(entry)) {
+      return null;
+    }
+    const text = extractStructuredText(entry);
+    if (typeof text === "string" && text.trim().length > 0) {
+      blocks.push({ kind: "text", text });
+    }
+  }
+
+  return sawImage ? blocks : null;
+}
+
+function rawPayloadHasNativeImages(content: string): boolean {
+  const parsed = parseJsonPayload(content);
+  return Array.isArray(parsed) && parsed.some((entry) => extractSingleNativeImageBufferFromValue(entry));
+}
+
+function extractSingleNativeImageBufferFromValue(value: unknown): Buffer | null {
+  const images = extractNativeImageBuffersFromValue(value);
+  return images.length === 1 ? images[0]! : null;
+}
+
+function isNativeImageEntry(value: unknown): boolean {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).type === "image"
+  );
 }
 
 function extractNativeImageBuffersFromValue(value: unknown): Buffer[] {
